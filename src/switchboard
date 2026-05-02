@@ -1,0 +1,88 @@
+#!/bin/bash
+# switchboard: file-based pub/sub for multi-Claude-session coordination.
+# https://github.com/sinisa/switchboard (or wherever this lives)
+#
+# Conversation log: /tmp/switchboard/log (canonical, ephemeral by design).
+# Per-subscriber cursor: /tmp/switchboard/cursor.<NAME>
+# Override DIR via SWITCHBOARD_DIR env var if needed for testing.
+set -eu
+DIR="${SWITCHBOARD_DIR:-/tmp/switchboard}"
+LOG="$DIR/log"
+mkdir -p "$DIR"
+touch "$LOG"
+
+: "${SWITCHBOARD_NAME:?export SWITCHBOARD_NAME=<your-handle> first}"
+CURSOR="$DIR/cursor.$SWITCHBOARD_NAME"
+
+cmd=${1:-}
+case "$cmd" in
+  send)
+    shift
+    if [ "${1:-}" = "-" ]; then
+      msg=$(cat)
+    elif [ "${1:-}" = "-f" ]; then
+      [ -z "${2:-}" ] && { echo "switchboard send -f <file>: missing file" >&2; exit 1; }
+      msg=$(cat "$2")
+    else
+      msg="$*"
+    fi
+    [ -z "$msg" ] && { echo "empty message" >&2; exit 1; }
+    ts=$(date '+%H:%M:%S')
+    # stamp EVERY line with [ts] name: prefix so line-based filters
+    # (grep -v ' name:') correctly exclude the full message, including
+    # multi-line bodies. trailing-newline-safe via the [ -n "$line" ] guard.
+    printf '%s\n' "$msg" | while IFS= read -r line || [ -n "$line" ]; do
+      printf '[%s] %s: %s\n' "$ts" "$SWITCHBOARD_NAME" "$line"
+    done >> "$LOG"
+    ;;
+  recv)
+    pos=$(cat "$CURSOR" 2>/dev/null || echo 0)
+    size=$(wc -c < "$LOG" | tr -d ' ')
+    if [ "$pos" -lt "$size" ]; then
+      tail -c +$((pos+1)) "$LOG"
+      echo "$size" > "$CURSOR"
+    fi
+    ;;
+  log)
+    cat "$LOG"
+    ;;
+  mark-read)
+    wc -c < "$LOG" | tr -d ' ' > "$CURSOR"
+    ;;
+  reset)
+    : > "$LOG"
+    rm -f "$DIR"/cursor.*
+    ;;
+  subscribe)
+    # emit the tail+grep command to live-stream the channel into Monitor.
+    # tail -n0 starts from end-of-file — NO backlog dump on join. mental model:
+    # subscribe gives the present, 'switchboard search <pat>' / 'switchboard log'
+    # give the past on demand. avoids flooding a fresh session's context.
+    # grep -v ' name:' drops the subscriber's own posts. since send stamps
+    # every line with [ts] name:, multi-line messages from self filter cleanly.
+    printf "tail -n0 -F %s 2>/dev/null | grep --line-buffered -v ' %s:'\n" "$LOG" "$SWITCHBOARD_NAME"
+    ;;
+  search)
+    shift
+    [ -z "${1:-}" ] && { echo "switchboard search <pattern>" >&2; exit 1; }
+    # on-demand history lookup. -n shows line numbers so 'switchboard log | sed -n L,Lp'
+    # can pull surrounding context. -E for extended regex. exit 0 even on no
+    # matches so callers can pipe without trapping.
+    grep -nE "$@" "$LOG" || true
+    ;;
+  *)
+    cat >&2 <<EOF
+usage: SWITCHBOARD_NAME=<handle> switchboard <cmd>
+  send <msg>          append a message (also: send -, send -f <file>)
+  recv                print messages since last recv (pull)
+  subscribe           print tail+grep cmd to pipe into Monitor (push, live only)
+  search <pattern>    grep history for a pattern (on-demand lookup)
+  log                 print full transcript
+  mark-read           skip current backlog
+  reset               wipe the channel (use sparingly)
+
+Conversation log lives at \$SWITCHBOARD_DIR/log (default: /tmp/switchboard/log).
+EOF
+    exit 1
+    ;;
+esac
