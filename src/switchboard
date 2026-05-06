@@ -28,9 +28,9 @@ case "$cmd" in
     fi
     [ -z "$msg" ] && { echo "empty message" >&2; exit 1; }
     ts=$(date '+%H:%M:%S')
-    # stamp EVERY line with [ts] name: prefix so line-based filters
-    # (grep -v ' name:') correctly exclude the full message, including
-    # multi-line bodies. trailing-newline-safe via the [ -n "$line" ] guard.
+    # stamp EVERY line with [ts] name: prefix so the anchored self-filter
+    # (^\[ts\] name:) correctly excludes full multi-line bodies.
+    # trailing-newline-safe via the [ -n "$line" ] guard.
     printf '%s\n' "$msg" | while IFS= read -r line || [ -n "$line" ]; do
       printf '[%s] %s: %s\n' "$ts" "$SWITCHBOARD_NAME" "$line"
     done >> "$LOG"
@@ -58,9 +58,11 @@ case "$cmd" in
     # tail -n0 starts from end-of-file — NO backlog dump on join. mental model:
     # subscribe gives the present, 'switchboard search <pat>' / 'switchboard log'
     # give the past on demand. avoids flooding a fresh session's context.
-    # grep -v ' name:' drops the subscriber's own posts. since send stamps
-    # every line with [ts] name:, multi-line messages from self filter cleanly.
-    printf "tail -n0 -F %s 2>/dev/null | grep --line-buffered -v ' %s:'\n" "$LOG" "$SWITCHBOARD_NAME"
+    # anchored self-filter: drop only lines whose body author is $NAME, not
+    # any line that mentions " $NAME:" inline (e.g. operator routing "john:
+    # do X" would otherwise be eaten by john's tail). pattern matches the
+    # exact stamp shape: [HH:MM:SS] name:
+    printf "tail -n0 -F %s 2>/dev/null | grep -E --line-buffered -v '^\\[[0-9:]+\\] %s:'\n" "$LOG" "$SWITCHBOARD_NAME"
     ;;
   search)
     shift
