@@ -2,10 +2,20 @@ use assert_cmd::Command;
 use predicates;
 use serde_json::Value;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn cmd(dir: &TempDir, handle: &str) -> Command {
     let mut c = Command::cargo_bin("switchboard").unwrap();
+    c.env("SWITCHBOARD_DIR", dir.path());
+    c.env("SWITCHBOARD_NAME", handle);
+    c.env_remove("SWITCHBOARD_CHANNEL");
+    c
+}
+
+fn raw_cmd(dir: &TempDir, handle: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("switchboard"));
     c.env("SWITCHBOARD_DIR", dir.path());
     c.env("SWITCHBOARD_NAME", handle);
     c.env_remove("SWITCHBOARD_CHANNEL");
@@ -373,4 +383,76 @@ fn prune_is_idempotent() {
     assert!(!alice_peer.exists());
     // Second prune on empty peers — should succeed without error.
     cmd(&dir, "admin").args(["prune"]).assert().success();
+}
+
+#[test]
+fn stream_exclude_self_suppresses_own_messages() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "from alice"]).assert().success();
+    cmd(&dir, "bob").args(["send", "from bob"]).assert().success();
+
+    let mut child = raw_cmd(&dir, "alice")
+        .args(["stream", "--from-start", "--exclude-self"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    let messages: Vec<_> = lines.iter().filter(|l| l["kind"] == "message").collect();
+    assert!(
+        messages.iter().any(|m| m["body"] == "from bob"),
+        "bob's message should be present"
+    );
+    assert!(
+        messages.iter().all(|m| m["from"].as_str() != Some("alice")),
+        "alice's messages should be excluded"
+    );
+}
+
+#[test]
+fn stream_kind_filters_backlog() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hello"]).assert().success();
+
+    let mut child = raw_cmd(&dir, "bob")
+        .args(["stream", "--from-start", "--kind", "message"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    // roster and ready are stream-machinery markers, not log records — they pass through.
+    let from_log: Vec<_> = lines
+        .iter()
+        .filter(|l| l["kind"] != "roster" && l["kind"] != "ready")
+        .collect();
+
+    assert!(!from_log.is_empty(), "should have at least one log record");
+    for rec in &from_log {
+        assert_eq!(
+            rec["kind"], "message",
+            "expected only message records from log; got {:?}",
+            rec
+        );
+    }
 }

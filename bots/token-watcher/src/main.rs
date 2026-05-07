@@ -3,9 +3,11 @@ use clap::Parser;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use switchboard::io::{append_record, peer_exists, touch_peer};
+use switchboard::io::{append_record, peer_exists, remove_peer, touch_peer};
 use switchboard::paths::{Env, PEER_STALE_SECS};
 use switchboard::record::Record;
 use switchboard::stream::Tailer;
@@ -65,6 +67,10 @@ struct Cli {
     /// Override context window for a model: --context-window claude-foo=180000.
     #[arg(long, value_parser = parse_window_override)]
     context_window: Vec<(String, u64)>,
+
+    /// Print correlation diagnostics to stderr.
+    #[arg(long)]
+    verbose: bool,
 }
 
 fn parse_threshold(s: &str) -> Result<f64, String> {
@@ -287,8 +293,15 @@ fn main() -> Result<()> {
     thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let context_overrides: HashMap<String, u64> = args.context_window.into_iter().collect();
+    let verbose = args.verbose;
     let handle = args.handle.clone();
     let env = Env::resolve(Some(handle.clone()), None)?;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("failed to set signal handler");
 
     let initial_channels: Vec<String> = if args.all {
         env.list_channels()?
@@ -332,7 +345,7 @@ fn main() -> Result<()> {
         handle, initial_channels, thresholds, args.poll, args.sitrep
     );
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         // Discover new channels under --all.
         if args.all {
             for ch in env.list_channels()? {
@@ -399,14 +412,18 @@ fn main() -> Result<()> {
                             }
                             if let Some(ps) = peers.get_mut(from) {
                                 ps.last_message_ts = Some(rec.ts);
-                                // First attempt at correlation. May fail if Claude Code
-                                // hasn't committed the turn's jsonl line yet — the poll
-                                // retry loop catches up later.
                                 if let Some(project_dir) = encoded_project_dir(&ps.cwd) {
                                     if let Some(jsonl) = jsonl_for_ts(&project_dir, rec.ts) {
+                                        if verbose {
+                                            eprintln!("verbose: {} → {}", from, jsonl.display());
+                                        }
                                         ps.transcript_path = Some(jsonl);
                                         ps.last_correlated_ts = Some(rec.ts);
+                                    } else if verbose {
+                                        eprintln!("verbose: {}: no matching jsonl in {}", from, project_dir.display());
                                     }
+                                } else if verbose {
+                                    eprintln!("verbose: {}: no project dir for cwd {}", from, ps.cwd.display());
                                 }
                             }
                         }
@@ -436,8 +453,13 @@ fn main() -> Result<()> {
                         if let Some(ts) = ps.last_message_ts {
                             if let Some(project_dir) = encoded_project_dir(&ps.cwd) {
                                 if let Some(jsonl) = jsonl_for_ts(&project_dir, ts) {
+                                    if verbose {
+                                        eprintln!("verbose: {} → {} (retry)", peer_handle, jsonl.display());
+                                    }
                                     ps.transcript_path = Some(jsonl);
                                     ps.last_correlated_ts = Some(ts);
+                                } else if verbose {
+                                    eprintln!("verbose: {}: retry failed, no matching jsonl", peer_handle);
                                 }
                             }
                         }
@@ -549,4 +571,14 @@ fn main() -> Result<()> {
 
         std::thread::sleep(DRAIN_INTERVAL);
     }
+
+    for ch_name in channels.keys() {
+        let rec = Record::leave(ch_name, &handle);
+        if let Err(e) = append_record(&env, ch_name, &rec) {
+            eprintln!("token-watcher: leave failed for {ch_name}: {e}");
+        }
+        let _ = remove_peer(&env, ch_name, &handle);
+    }
+    eprintln!("token-watcher: shutdown complete");
+    Ok(())
 }

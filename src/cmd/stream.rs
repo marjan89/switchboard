@@ -53,14 +53,14 @@ pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>, filte
     let mut stdout = std::io::stdout().lock();
 
     for ch in &initial {
-        bring_up(env, ch, &start, &mut tailers, &mut stdout)?;
+        bring_up(env, ch, &start, &filter, &mut tailers, &mut stdout)?;
     }
 
     loop {
         if matches!(scope, Scope::All) {
             for ch in env.list_channels()? {
                 if !tailers.contains_key(&ch) {
-                    bring_up(env, &ch, &start, &mut tailers, &mut stdout)?;
+                    bring_up(env, &ch, &start, &filter, &mut tailers, &mut stdout)?;
                 }
             }
         }
@@ -94,6 +94,7 @@ fn bring_up<W: Write>(
     env: &Env,
     channel: &str,
     start: &Start,
+    filter: &Filter,
     tailers: &mut HashMap<String, Tailer>,
     out: &mut W,
 ) -> Result<()> {
@@ -114,9 +115,11 @@ fn bring_up<W: Write>(
     };
 
     tailer.drain(|rec| {
-        serde_json::to_writer(&mut *out, rec)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+        if filter.accept(rec) {
+            serde_json::to_writer(&mut *out, rec)?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+        }
         Ok(())
     })?;
 

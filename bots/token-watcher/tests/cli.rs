@@ -497,3 +497,63 @@ fn custom_threshold_triggers_at_lower_level() {
     assert!(body.contains("alice"), "body: {body}");
     assert!(body.contains("30%"), "expected 30%%; got: {body}");
 }
+
+#[test]
+fn verbose_logs_correlation_to_stderr() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let transcript = h.project_dir.join("alice-session.jsonl");
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 100_000, 100);
+
+    let mut child = std::process::Command::new(watcher_bin())
+        .env("SWITCHBOARD_DIR", h.sw_dir.path())
+        .env("HOME", h.home.path())
+        .args(["--channel", "default", "--poll", "1", "--verbose"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(stderr.contains("verbose:"), "stderr should contain verbose output: {stderr}");
+    assert!(stderr.contains("alice"), "verbose stderr should mention alice: {stderr}");
+    assert!(stderr.contains(".jsonl"), "verbose stderr should mention jsonl path: {stderr}");
+}
+
+#[test]
+fn graceful_shutdown_emits_leave() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let child = std::process::Command::new(watcher_bin())
+        .env("SWITCHBOARD_DIR", h.sw_dir.path())
+        .env("HOME", h.home.path())
+        .args(["--channel", "default", "--poll", "60"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Send SIGINT for graceful shutdown.
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT); }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(stderr.contains("shutdown complete"), "stderr: {stderr}");
+
+    let lines = h.read_log_lines("default");
+    let bot_leave = lines
+        .iter()
+        .find(|l| l["kind"] == "leave" && l["handle"] == "bot-token-watcher");
+    assert!(bot_leave.is_some(), "expected bot to emit leave on shutdown");
+
+    let peer = h.sw_dir.path().join("default").join("peers").join("bot-token-watcher");
+    assert!(!peer.exists(), "peer file should be removed on shutdown");
+}
