@@ -456,3 +456,114 @@ fn stream_kind_filters_backlog() {
         );
     }
 }
+
+#[test]
+fn hold_emits_hold_record() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["hold"]).assert().success();
+    let lines = read_log_lines(&dir, "default");
+    let hold = lines.iter().find(|l| l["kind"] == "hold").unwrap();
+    assert_eq!(hold["from"], "alice");
+    let body = hold["body"].as_str().unwrap();
+    assert!(body.starts_with("Hold"), "body: {body}");
+    assert!(body.contains("wait for resume"), "body: {body}");
+}
+
+#[test]
+fn resume_emits_resume_record() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["resume"]).assert().success();
+    let lines = read_log_lines(&dir, "default");
+    let resume = lines.iter().find(|l| l["kind"] == "resume").unwrap();
+    assert_eq!(resume["from"], "alice");
+    let body = resume["body"].as_str().unwrap();
+    assert!(body.starts_with("Resume"), "body: {body}");
+    assert!(body.contains("wire is live"), "body: {body}");
+}
+
+#[test]
+fn hold_does_not_block_send() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["hold"]).assert().success();
+    cmd(&dir, "bob").args(["send", "still works"]).assert().success();
+    let lines = read_log_lines(&dir, "default");
+    let msg = lines
+        .iter()
+        .find(|l| l["kind"] == "message")
+        .expect("send should still work during hold");
+    assert_eq!(msg["body"], "still works");
+    assert_eq!(msg["from"], "bob");
+}
+
+#[test]
+fn recv_on_empty_channel_returns_nothing() {
+    let dir = TempDir::new().unwrap();
+    let out = cmd(&dir, "alice").args(["recv"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(), "recv on empty channel should return nothing");
+}
+
+#[test]
+fn log_from_filter_matches_handle_on_join_leave() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    cmd(&dir, "bob").args(["send", "yo"]).assert().success();
+    cmd(&dir, "alice").args(["leave"]).assert().success();
+
+    let out = cmd(&dir, "alice")
+        .args(["log", "--from", "alice"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "alice: join + message + leave");
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, vec!["join", "message", "leave"]);
+
+    let out = cmd(&dir, "bob")
+        .args(["log", "--from", "bob"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "bob: join + message");
+}
+
+#[test]
+fn auto_chunk_does_not_split_multibyte_char() {
+    let dir = TempDir::new().unwrap();
+    let mut body = "x".repeat(4074);
+    body.push_str("\u{1F525}"); // 🔥 (4 bytes at position 4074)
+    body.push_str(&"y".repeat(100));
+
+    cmd(&dir, "alice")
+        .args(["send", &body])
+        .assert()
+        .success();
+
+    let lines = read_log_lines(&dir, "default");
+    let msgs: Vec<_> = lines.iter().filter(|l| l["kind"] == "message").collect();
+    assert_eq!(msgs.len(), 2, "expected 2 chunks");
+
+    let total: String = msgs
+        .iter()
+        .map(|m| {
+            let b = m["body"].as_str().unwrap();
+            let end = b.find(") ").unwrap();
+            b[end + 2..].to_string()
+        })
+        .collect();
+
+    assert!(total.contains('\u{1F525}'), "emoji should be intact after chunking");
+    assert!(!total.contains('\u{FFFD}'), "no replacement characters");
+    assert_eq!(total.len(), body.len(), "reassembled length should match original");
+}

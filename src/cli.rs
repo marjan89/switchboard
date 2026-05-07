@@ -101,6 +101,12 @@ pub enum Cmd {
 
     /// Advance cursor.<handle> to current EOF (drop pending backlog).
     MarkRead,
+
+    /// Emit kind:hold — signal participants to finish current message and wait.
+    Hold,
+
+    /// Emit kind:resume — signal participants the wire is live.
+    Resume,
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -171,6 +177,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let handle = env.require_handle()?;
             let channel = env.channel();
             cmd::mark_read::run(&env, handle, channel)
+        }
+        Cmd::Hold => {
+            let handle = env.require_handle()?;
+            let channel = env.channel();
+            cmd::hold::run(&env, handle, channel)
+        }
+        Cmd::Resume => {
+            let handle = env.require_handle()?;
+            let channel = env.channel();
+            cmd::resume::run(&env, handle, channel)
         }
     }
 }

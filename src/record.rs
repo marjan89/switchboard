@@ -105,6 +105,36 @@ impl Record {
         Self::system_event(ch, "rotated", None)
     }
 
+    pub fn hold(ch: &str, from: &str) -> Self {
+        Self {
+            ts: Utc::now(),
+            ch: ch.to_string(),
+            kind: "hold".to_string(),
+            from: Some(from.to_string()),
+            to: vec![],
+            body: Some("Hold \u{2014} finish your current message, then wait for resume before posting.".to_string()),
+            handle: None,
+            members: vec![],
+            cwd: None,
+            level: None,
+        }
+    }
+
+    pub fn resume(ch: &str, from: &str) -> Self {
+        Self {
+            ts: Utc::now(),
+            ch: ch.to_string(),
+            kind: "resume".to_string(),
+            from: Some(from.to_string()),
+            to: vec![],
+            body: Some("Resume \u{2014} wire is live, continue.".to_string()),
+            handle: None,
+            members: vec![],
+            cwd: None,
+            level: None,
+        }
+    }
+
     fn system_event(ch: &str, kind: &str, handle: Option<String>) -> Self {
         Self {
             ts: Utc::now(),

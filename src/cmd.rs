@@ -1,10 +1,12 @@
 pub mod channels;
+pub mod hold;
 pub mod leave;
 pub mod log;
 pub mod mark_read;
 pub mod peers;
 pub mod prune;
 pub mod recv;
+pub mod resume;
 pub mod send;
 pub mod status;
 pub mod stream;
