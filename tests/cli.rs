@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates;
 use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
@@ -163,7 +164,79 @@ fn log_filters_by_kind_and_from() {
     let out = cmd(&dir, "alice").args(["log", "--from", "bob"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 1);
-    let v: Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(v["from"], "bob");
+    assert_eq!(lines.len(), 2, "--from bob should match join (handle) + message (from)");
+    let kinds: Vec<&str> = lines.iter().map(|l| {
+        let v: Value = serde_json::from_str(l).unwrap();
+        match v["kind"].as_str().unwrap() {
+            "join" => "join",
+            "message" => "message",
+            other => panic!("unexpected kind: {other}"),
+        }
+    }).collect();
+    assert!(kinds.contains(&"join"), "should include bob's join");
+    assert!(kinds.contains(&"message"), "should include bob's message");
+}
+
+#[test]
+fn handle_with_slash_rejected() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "../../etc/passwd")
+        .args(["send", "hi"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("path separators"));
+}
+
+#[test]
+fn handle_with_dotdot_rejected() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "..")
+        .args(["send", "hi"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("must not be '.' or '..'"));
+}
+
+#[test]
+fn handle_with_control_char_rejected() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "evil\nhandle")
+        .args(["send", "hi"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("control characters"));
+}
+
+#[test]
+fn channel_with_slash_rejected() {
+    let dir = TempDir::new().unwrap();
+    let mut c = Command::cargo_bin("switchboard").unwrap();
+    c.env("SWITCHBOARD_DIR", dir.path());
+    c.env("SWITCHBOARD_NAME", "alice");
+    c.env("SWITCHBOARD_CHANNEL", "../../tmp/pwned");
+    c.args(["send", "hi"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("path separators"));
+}
+
+#[test]
+fn phantom_leave_is_noop() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    cmd(&dir, "ghost").args(["leave"]).assert().success();
+    let lines = read_log_lines(&dir, "default");
+    let leaves: Vec<_> = lines.iter().filter(|l| l["kind"] == "leave").collect();
+    assert_eq!(leaves.len(), 0, "phantom leave should not emit a record");
+}
+
+#[test]
+fn double_leave_emits_only_once() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    cmd(&dir, "alice").args(["leave"]).assert().success();
+    cmd(&dir, "alice").args(["leave"]).assert().success();
+    let lines = read_log_lines(&dir, "default");
+    let leaves: Vec<_> = lines.iter().filter(|l| l["kind"] == "leave").collect();
+    assert_eq!(leaves.len(), 1, "double leave should emit only one record");
 }

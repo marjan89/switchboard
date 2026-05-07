@@ -50,7 +50,9 @@ pub fn run(
             }
         }
         if let Some(f) = from {
-            if rec.from.as_deref() != Some(f) {
+            let matches_from = rec.from.as_deref() == Some(f);
+            let matches_handle = rec.handle.as_deref() == Some(f);
+            if !matches_from && !matches_handle {
                 continue;
             }
         }

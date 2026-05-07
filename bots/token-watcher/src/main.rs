@@ -3,19 +3,34 @@ use clap::Parser;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use switchboard::io::{append_record, peer_exists, touch_peer};
-use switchboard::paths::Env;
+use switchboard::paths::{Env, PEER_STALE_SECS};
 use switchboard::record::Record;
 use switchboard::stream::Tailer;
 
 const DEFAULT_HANDLE: &str = "bot-token-watcher";
 const DEFAULT_THRESHOLDS: &[f64] = &[0.8, 0.9, 0.95];
 const DEFAULT_POLL_SECS: u64 = 5;
-const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const DRAIN_INTERVAL: Duration = Duration::from_millis(150);
 
+const DEFAULT_WINDOW: u64 = 200_000;
+
+const MODEL_WINDOWS: &[(&str, u64)] = &[
+    ("claude-opus-4", 1_000_000),
+    ("claude-sonnet-4", 1_000_000),
+];
+
+fn default_context_window(model: &str) -> u64 {
+    MODEL_WINDOWS
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, w)| *w)
+        .unwrap_or(DEFAULT_WINDOW)
+}
+
+/// Peers whose `peers/<handle>` mtime is older than this are treated as gone
 #[derive(Parser)]
 #[command(
     name = "switchboard-token-watcher",
@@ -96,9 +111,20 @@ struct TranscriptRecord {
 
 struct PeerState {
     cwd: PathBuf,
+    /// Discovered via temporal correlation. None until a `kind:"message"` from
+    /// this peer has been correlated to a jsonl in their cwd.
+    transcript_path: Option<PathBuf>,
+    /// Timestamp of the most recent `kind:"message"` from this peer.
+    last_message_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Timestamp of the message ts that produced the current `transcript_path`.
+    /// When `last_message_ts != last_correlated_ts`, the next poll re-attempts
+    /// correlation. Once it succeeds, the two equalize and the mapping is sticky
+    /// until a fresh message arrives. Prevents re-correlation from ping-ponging
+    /// transcript_path across other sessions' jsonls in the same cwd.
+    last_correlated_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Indices into the (sorted ascending) thresholds list that have already
-    /// been alerted on. Cleared when the participant's footprint drops below
-    /// the lowest threshold (compaction observed).
+    /// been alerted on. Cleared when input drops below the lowest threshold
+    /// (compaction observed).
     crossed: HashSet<usize>,
 }
 
@@ -121,9 +147,34 @@ fn encoded_project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(home.join(".claude").join("projects").join(encoded))
 }
 
-/// Find the most-recently-modified .jsonl in a project dir.
-fn newest_jsonl(project_dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+/// Asymmetric window for matching a jsonl's mtime against a switchboard
+/// message's ts. Backward (jsonl touched before message) is small — only
+/// absorbs scheduling jitter. Forward (jsonl touched after message) is large
+/// because Claude Code commits a turn's transcript line only after every
+/// tool call in that turn completes; a turn with many tool calls can make
+/// jsonl mtime lag the switchboard message ts by minutes.
+const TS_MATCH_WINDOW_BACK_SECS: u64 = 10;
+const TS_MATCH_WINDOW_FWD_SECS: u64 = 600;
+
+/// Find the .jsonl in `project_dir` whose mtime is closest to `ts` within a
+/// small window. Used for temporal correlation: when handle H sends a switchboard
+/// message at time T, the jsonl whose mtime is within ±10s of T is H's transcript
+/// (the session that just took a turn). Returns `None` if no jsonl matches —
+/// e.g. the message is old backlog and the file has been touched many times since.
+fn jsonl_for_ts(project_dir: &Path, ts: chrono::DateTime<chrono::Utc>) -> Option<PathBuf> {
+    let secs = ts.timestamp();
+    let nanos = ts.timestamp_subsec_nanos();
+    if secs < 0 {
+        return None;
+    }
+    let target =
+        std::time::UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))?;
+    let earliest = target
+        .checked_sub(Duration::from_secs(TS_MATCH_WINDOW_BACK_SECS))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let latest = target.checked_add(Duration::from_secs(TS_MATCH_WINDOW_FWD_SECS))?;
+
+    let mut best: Option<(PathBuf, SystemTime, Duration)> = None;
     let entries = std::fs::read_dir(project_dir).ok()?;
     for e in entries.flatten() {
         let path = e.path();
@@ -134,14 +185,23 @@ fn newest_jsonl(project_dir: &Path) -> Option<PathBuf> {
             Some(t) => t,
             None => continue,
         };
-        if best.as_ref().map(|(_, bt)| m > *bt).unwrap_or(true) {
-            best = Some((path, m));
+        if m < earliest || m > latest {
+            continue;
+        }
+        // Pick the one whose mtime is closest to ts.
+        let dist = if m >= target {
+            m.duration_since(target).unwrap_or(Duration::ZERO)
+        } else {
+            target.duration_since(m).unwrap_or(Duration::ZERO)
+        };
+        if best.as_ref().map(|(_, _, bd)| dist < *bd).unwrap_or(true) {
+            best = Some((path, m, dist));
         }
     }
-    best.map(|(p, _)| p)
+    best.map(|(p, _, _)| p)
 }
 
-/// Read latest assistant turn's model + input footprint from a transcript JSONL.
+/// Read the latest assistant turn's model + input footprint from a transcript.
 fn read_reading(transcript: &Path) -> Option<Reading> {
     let content = std::fs::read_to_string(transcript).ok()?;
     let mut last: Option<(String, TranscriptUsage)> = None;
@@ -198,6 +258,24 @@ fn bot_join(env: &Env, channel: &str, handle: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when `peers/<handle>` exists and was touched within PEER_STALE_SECS.
+/// Filesystem presence + recency is the source of truth for "currently around" —
+/// channel join/leave events alone leak ghosts when sessions exit without
+/// calling `switchboard leave`.
+fn peer_is_fresh(env: &Env, channel: &str, handle: &str) -> bool {
+    let path = env.peer_file(channel, handle);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d <= Duration::from_secs(PEER_STALE_SECS))
+        .unwrap_or(false)
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -226,7 +304,6 @@ fn main() -> Result<()> {
 
     let mut channels: HashMap<String, ChannelState> = HashMap::new();
     for ch in &initial_channels {
-        // Open at_start so we replay backlog and learn existing joins.
         let tailer = Tailer::at_start(&env, ch)?;
         bot_join(&env, ch, &handle)?;
         channels.insert(
@@ -273,7 +350,12 @@ fn main() -> Result<()> {
             }
         }
 
-        // Drain channel events: register on join (with cwd), unregister on leave.
+        // Drain channel events:
+        // - "join" → register handle + cwd (no transcript_path yet)
+        // - "leave" → drop handle
+        // - "message" → temporal correlation: pick the jsonl in this peer's
+        //   cwd whose mtime is freshest *right now* (the session that just
+        //   took a turn). Sticky cache; only updated when a new message lands.
         for state in channels.values_mut() {
             let tailer = &mut state.tailer;
             let peers = &mut state.peers;
@@ -285,18 +367,48 @@ fn main() -> Result<()> {
                             if h == bot_handle {
                                 return Ok(());
                             }
-                            peers.insert(
-                                h.clone(),
-                                PeerState {
-                                    cwd: PathBuf::from(cwd),
-                                    crossed: HashSet::new(),
-                                },
-                            );
+                            // Don't reset crossed if this handle is already known with the
+                            // same cwd — preserves alert-suppression across re-joins.
+                            let new_cwd = PathBuf::from(cwd);
+                            match peers.get_mut(h) {
+                                Some(existing) if existing.cwd == new_cwd => {}
+                                _ => {
+                                    peers.insert(
+                                        h.clone(),
+                                        PeerState {
+                                            cwd: new_cwd,
+                                            transcript_path: None,
+                                            last_message_ts: None,
+                                            last_correlated_ts: None,
+                                            crossed: HashSet::new(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     "leave" => {
                         if let Some(h) = rec.handle.as_ref() {
                             peers.remove(h);
+                        }
+                    }
+                    "message" => {
+                        if let Some(from) = rec.from.as_ref() {
+                            if from == bot_handle {
+                                return Ok(());
+                            }
+                            if let Some(ps) = peers.get_mut(from) {
+                                ps.last_message_ts = Some(rec.ts);
+                                // First attempt at correlation. May fail if Claude Code
+                                // hasn't committed the turn's jsonl line yet — the poll
+                                // retry loop catches up later.
+                                if let Some(project_dir) = encoded_project_dir(&ps.cwd) {
+                                    if let Some(jsonl) = jsonl_for_ts(&project_dir, rec.ts) {
+                                        ps.transcript_path = Some(jsonl);
+                                        ps.last_correlated_ts = Some(rec.ts);
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -310,22 +422,37 @@ fn main() -> Result<()> {
             for (ch_name, state) in channels.iter_mut() {
                 let mut warnings: Vec<(String, &'static str)> = vec![];
                 for (peer_handle, ps) in state.peers.iter_mut() {
-                    let project_dir = match encoded_project_dir(&ps.cwd) {
-                        Some(p) => p,
-                        None => continue,
+                    // Skip stale peers — they're tracked but not currently around.
+                    // They re-engage automatically on next fresh send (which touches
+                    // peers/<handle>).
+                    if !peer_is_fresh(&env, ch_name, peer_handle) {
+                        continue;
+                    }
+                    // Retry correlation only if the most recent message hasn't been
+                    // correlated yet (or if a fresher message has arrived since the
+                    // last successful correlation). Sticky once mapped — no
+                    // ping-ponging transcript_path across sibling sessions' jsonls.
+                    if ps.last_message_ts != ps.last_correlated_ts {
+                        if let Some(ts) = ps.last_message_ts {
+                            if let Some(project_dir) = encoded_project_dir(&ps.cwd) {
+                                if let Some(jsonl) = jsonl_for_ts(&project_dir, ts) {
+                                    ps.transcript_path = Some(jsonl);
+                                    ps.last_correlated_ts = Some(ts);
+                                }
+                            }
+                        }
+                    }
+                    let Some(transcript) = ps.transcript_path.as_ref() else {
+                        continue; // no message yet — no mapping
                     };
-                    let transcript = match newest_jsonl(&project_dir) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let reading = match read_reading(&transcript) {
+                    let reading = match read_reading(transcript) {
                         Some(r) => r,
                         None => continue,
                     };
                     let window = context_overrides
                         .get(&reading.model)
                         .copied()
-                        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+                        .unwrap_or_else(|| default_context_window(&reading.model));
                     if window == 0 {
                         continue;
                     }
@@ -379,17 +506,19 @@ fn main() -> Result<()> {
                     }
                     let mut entries: Vec<String> = vec![];
                     for (peer_handle, ps) in state.peers.iter() {
-                        let project_dir = match encoded_project_dir(&ps.cwd) {
-                            Some(p) => p,
-                            None => continue,
+                        if !peer_is_fresh(&env, ch_name, peer_handle) {
+                            continue;
+                        }
+                        let Some(transcript) = ps.transcript_path.as_ref() else {
+                            entries.push(format!("{peer_handle} (unmapped)"));
+                            continue;
                         };
-                        let reading = newest_jsonl(&project_dir).and_then(|p| read_reading(&p));
-                        match reading {
+                        match read_reading(transcript) {
                             Some(r) => {
                                 let window = context_overrides
                                     .get(&r.model)
                                     .copied()
-                                    .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+                                    .unwrap_or_else(|| default_context_window(&r.model));
                                 let pct = if window == 0 {
                                     0.0
                                 } else {

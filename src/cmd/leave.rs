@@ -5,8 +5,7 @@ use crate::paths::Env;
 use crate::record::Record;
 
 pub fn run(env: &Env, handle: &str, channel: &str) -> Result<()> {
-    let log_exists = env.log_path(channel).exists();
-    if !peer_exists(env, channel, handle) && !log_exists {
+    if !peer_exists(env, channel, handle) {
         return Ok(());
     }
     append_record(env, channel, &Record::leave(channel, handle))?;

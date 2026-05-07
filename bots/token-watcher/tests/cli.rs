@@ -152,8 +152,10 @@ fn bot_emits_join_on_startup() {
     let lines = h.read_log_lines("default");
     let bot_join = lines
         .iter()
-        .find(|l| l["kind"] == "join" && l["handle"] == "bot-token-watcher");
-    assert!(bot_join.is_some(), "expected bot to emit kind:join");
+        .find(|l| l["kind"] == "join" && l["handle"] == "bot-token-watcher")
+        .expect("expected bot to emit kind:join");
+    assert_eq!(bot_join["kind"], "join");
+    assert_eq!(bot_join["handle"], "bot-token-watcher");
 }
 
 #[test]
@@ -163,7 +165,7 @@ fn bot_emits_service_announcement_when_threshold_crossed() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 180_000, 100); // 90%
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 180_000, 100); // 90%
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
     thread::sleep(Duration::from_millis(2500));
@@ -177,8 +179,8 @@ fn bot_emits_service_announcement_when_threshold_crossed() {
     assert!(warning.is_some(), "expected service_announcement; got {} records", lines.len());
     let body = warning.unwrap()["body"].as_str().unwrap();
     assert!(body.contains("alice"), "body: {body}");
-    assert!(body.contains("claude-opus-4-7"), "body: {body}");
-    assert!(body.contains("90%") || body.contains("89%"), "body: {body}");
+    assert!(body.contains("claude-haiku-4-5"), "body: {body}");
+    assert!(body.contains("90%"), "expected 90%%; body: {body}");
     assert_eq!(warning.unwrap()["level"], "critical");
 }
 
@@ -189,7 +191,7 @@ fn bot_does_not_double_warn_same_threshold() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 165_000, 100); // 82.5%
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 165_000, 100); // 82.5%
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
     thread::sleep(Duration::from_millis(3500));
@@ -216,7 +218,7 @@ fn bot_re_arms_after_compaction() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 180_000, 100); // 90%
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 180_000, 100); // 90%
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
     thread::sleep(Duration::from_millis(2200));
@@ -224,7 +226,7 @@ fn bot_re_arms_after_compaction() {
     // Simulate compaction: rewrite transcript to a small turn well below lowest threshold.
     fs::write(
         &transcript,
-        r#"{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":50}}}
+        r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":50}}}
 "#,
     )
     .unwrap();
@@ -233,7 +235,7 @@ fn bot_re_arms_after_compaction() {
     // Climb back over.
     fs::write(
         &transcript,
-        r#"{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":180000,"output_tokens":100}}}
+        r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":180000,"output_tokens":100}}}
 "#,
     )
     .unwrap();
@@ -261,7 +263,7 @@ fn bot_drops_mapping_on_leave() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 100_000, 100); // 50% — under
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 100_000, 100); // 50% — under
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
     thread::sleep(Duration::from_millis(800));
@@ -272,7 +274,7 @@ fn bot_drops_mapping_on_leave() {
     // Push transcript over the threshold — mapping was dropped, no warning expected.
     fs::write(
         &transcript,
-        r#"{"type":"assistant","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":180000,"output_tokens":100}}}
+        r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":180000,"output_tokens":100}}}
 "#,
     )
     .unwrap();
@@ -295,13 +297,101 @@ fn bot_drops_mapping_on_leave() {
 }
 
 #[test]
+fn bot_disambiguates_two_handles_in_same_cwd() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+
+    let alice_jsonl = h.project_dir.join("alice-session.jsonl");
+    let bob_jsonl = h.project_dir.join("bob-session.jsonl");
+
+    // alice's transcript: 90% of 200K window — should warn at 0.8.
+    h.write_assistant_turn(&alice_jsonl, "claude-haiku-4-5", 1, 0, 180_000, 100);
+    // alice sends → her message correlates to alice_jsonl (only jsonl in dir at this point).
+    h.switchboard("alice").args(["send", "alice posting"]).assert().success();
+    thread::sleep(Duration::from_millis(50));
+
+    // bob's transcript: 50% — under threshold, should NOT warn.
+    h.write_assistant_turn(&bob_jsonl, "claude-haiku-4-5", 1, 0, 100_000, 100);
+    // bob sends → his message correlates to bob_jsonl (now newest in dir).
+    h.switchboard("bob").args(["send", "bob posting"]).assert().success();
+
+    let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warns: Vec<_> = lines
+        .iter()
+        .filter(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .collect();
+    assert_eq!(warns.len(), 1, "expected exactly one warning (alice only); got {}", warns.len());
+    let body = warns[0]["body"].as_str().unwrap();
+    assert!(body.contains("alice"), "expected alice in warning; got: {body}");
+    assert!(!body.contains("bob"), "expected NO bob in warning; got: {body}");
+    assert!(body.contains("90%"), "expected 90%%; got: {body}");
+    assert_eq!(warns[0]["level"], "critical");
+}
+
+#[test]
+fn bot_culls_ghost_peer_when_presence_file_removed() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+
+    // alice joins, sends, then her peer file is wiped (simulating crash without leave).
+    let alice_jsonl = h.project_dir.join("alice-session.jsonl");
+    h.write_assistant_turn(&alice_jsonl, "claude-haiku-4-5", 1, 0, 100_000, 100);
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    // Bot starts with the (still-active) alice peer file present.
+    let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
+    thread::sleep(Duration::from_millis(800));
+
+    // Wipe alice's presence file — ghost.
+    let alice_peer = h.sw_dir.path().join("default").join("peers").join("alice");
+    fs::remove_file(&alice_peer).unwrap();
+
+    // Push alice's transcript way over threshold. With ghost-cull, bot drops her
+    // BEFORE the next poll, so no warning.
+    fs::write(
+        &alice_jsonl,
+        r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":195000,"output_tokens":100}}}
+"#,
+    )
+    .unwrap();
+
+    // Wait long enough for cull (10s) and a subsequent poll to confirm no warning.
+    thread::sleep(Duration::from_millis(11500));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warns: Vec<_> = lines
+        .iter()
+        .filter(|l| {
+            l["kind"] == "service_announcement"
+                && l["from"] == "bot-token-watcher"
+                && l["body"].as_str().unwrap_or("").contains("alice")
+        })
+        .collect();
+    // We allow at most ONE warning — the very first poll, before the peer file
+    // was removed. Any warning AFTER cull would mean the ghost wasn't dropped.
+    assert!(
+        warns.len() <= 1,
+        "expected at most one warning before cull; got {} (ghost not dropped)",
+        warns.len()
+    );
+}
+
+#[test]
 fn bot_emits_sitrep_message_when_enabled() {
     ensure_switchboard_built();
     let h = Harness::new();
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 100_000, 100); // 50%
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 100_000, 100); // 50%
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "60", "--sitrep", "1"]);
     thread::sleep(Duration::from_millis(2500));
@@ -320,5 +410,90 @@ fn bot_emits_sitrep_message_when_enabled() {
     assert!(!sitreps.is_empty(), "expected at least one sitrep message");
     let body = sitreps[0]["body"].as_str().unwrap();
     assert!(body.contains("alice"), "sitrep body: {body}");
-    assert!(body.contains("claude-opus-4-7"), "sitrep body: {body}");
+    assert!(body.contains("claude-haiku-4-5"), "sitrep body: {body}");
+}
+
+#[test]
+fn opus_uses_1m_context_window() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let transcript = h.project_dir.join("alice-session.jsonl");
+    // 850K cached on opus-4-7 → 85% of 1M, should warn at 0.8 threshold.
+    // If bot incorrectly used 200K, this would be 425% — obviously wrong.
+    h.write_assistant_turn(&transcript, "claude-opus-4-7", 1, 0, 850_000, 100);
+
+    let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warning = lines
+        .iter()
+        .find(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .expect("expected service_announcement for opus at 85%");
+    let body = warning["body"].as_str().unwrap();
+    assert!(body.contains("1000.0k"), "expected 1M window; got: {body}");
+    assert!(body.contains("85%"), "expected 85%%; got: {body}");
+    assert!(body.contains("claude-opus-4-7"), "expected model name; got: {body}");
+}
+
+#[test]
+fn context_window_override_changes_percentage() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let transcript = h.project_dir.join("alice-session.jsonl");
+    // 80K cached on haiku — default 200K window → 40% (no warning at 0.8 threshold).
+    // With --context-window claude-haiku-4-5=90000, that's 89% → should warn.
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 80_000, 100);
+
+    let mut child = h.spawn_bot(&[
+        "--channel", "default", "--poll", "1",
+        "--context-window", "claude-haiku-4-5=90000",
+    ]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warning = lines
+        .iter()
+        .find(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .expect("expected warning with overridden window");
+    let body = warning["body"].as_str().unwrap();
+    assert!(body.contains("90.0k"), "expected 90K window; got: {body}");
+    assert!(body.contains("88%") || body.contains("89%"), "expected ~89%%; got: {body}");
+}
+
+#[test]
+fn custom_threshold_triggers_at_lower_level() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let transcript = h.project_dir.join("alice-session.jsonl");
+    // 60K cached on haiku (200K window) → 30%. Default thresholds [0.8, 0.9, 0.95] won't fire.
+    // With --threshold 0.25, it should.
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 60_000, 100);
+
+    let mut child = h.spawn_bot(&[
+        "--channel", "default", "--poll", "1",
+        "--threshold", "0.25",
+    ]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warning = lines
+        .iter()
+        .find(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .expect("expected warning at custom 25% threshold");
+    let body = warning["body"].as_str().unwrap();
+    assert!(body.contains("alice"), "body: {body}");
+    assert!(body.contains("30%"), "expected 30%%; got: {body}");
 }

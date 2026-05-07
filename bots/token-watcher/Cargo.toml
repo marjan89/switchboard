@@ -1,6 +1,6 @@
 [package]
 name = "switchboard-token-watcher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Switchboard bot: warn participants approaching their model's context-window limit"
 

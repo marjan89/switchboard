@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
 
 pub const DEFAULT_CHANNEL: &str = "default";
@@ -8,6 +8,27 @@ pub const PEER_STALE_SECS: u64 = 300;
 
 /// Hard cap on a single message body to keep POSIX append atomic.
 pub const MAX_BODY_BYTES: usize = 4096;
+
+const MAX_NAME_LEN: usize = 64;
+
+fn validate_name(kind: &str, s: &str) -> Result<String> {
+    if s.is_empty() {
+        bail!("{kind} must not be empty");
+    }
+    if s.len() > MAX_NAME_LEN {
+        bail!("{kind} exceeds {MAX_NAME_LEN}-char limit");
+    }
+    if s == "." || s == ".." {
+        bail!("{kind} must not be '.' or '..'");
+    }
+    if s.contains('/') || s.contains('\\') {
+        bail!("{kind} must not contain path separators");
+    }
+    if s.bytes().any(|b| b < 0x20) {
+        bail!("{kind} must not contain control characters");
+    }
+    Ok(s.to_string())
+}
 
 pub struct Env {
     root: PathBuf,
@@ -26,11 +47,14 @@ impl Env {
             }
         };
         let handle = handle_arg.or_else(|| std::env::var("SWITCHBOARD_NAME").ok())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(|s| validate_name("handle", &s))
+            .transpose()?;
         let channel = channel_arg
             .or_else(|| std::env::var("SWITCHBOARD_CHANNEL").ok())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_CHANNEL.to_string());
+        let channel = validate_name("channel", &channel)?;
         Ok(Self { root, handle, channel })
     }
 
