@@ -263,7 +263,7 @@ fn bot_drops_mapping_on_leave() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 100_000, 100); // 50% — under
+    h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 40_000, 100); // 20% — under all thresholds
 
     let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
     thread::sleep(Duration::from_millis(800));
@@ -310,8 +310,8 @@ fn bot_disambiguates_two_handles_in_same_cwd() {
     h.switchboard("alice").args(["send", "alice posting"]).assert().success();
     thread::sleep(Duration::from_millis(50));
 
-    // bob's transcript: 50% — under threshold, should NOT warn.
-    h.write_assistant_turn(&bob_jsonl, "claude-haiku-4-5", 1, 0, 100_000, 100);
+    // bob's transcript: 20% — under multi-agent 25% threshold, should NOT warn.
+    h.write_assistant_turn(&bob_jsonl, "claude-haiku-4-5", 1, 0, 40_000, 100);
     // bob sends → his message correlates to bob_jsonl (now newest in dir).
     h.switchboard("bob").args(["send", "bob posting"]).assert().success();
 
@@ -476,7 +476,7 @@ fn custom_threshold_triggers_at_lower_level() {
     h.switchboard("alice").args(["send", "hi"]).assert().success();
 
     let transcript = h.project_dir.join("alice-session.jsonl");
-    // 60K cached on haiku (200K window) → 30%. Default thresholds [0.8, 0.9, 0.95] won't fire.
+    // 60K cached on haiku (200K window) → 30%. Single-agent defaults [0.50, 0.60, 0.70] won't fire.
     // With --threshold 0.25, it should.
     h.write_assistant_turn(&transcript, "claude-haiku-4-5", 1, 0, 60_000, 100);
 
@@ -526,6 +526,41 @@ fn verbose_logs_correlation_to_stderr() {
 }
 
 #[test]
+fn multi_agent_uses_lower_thresholds() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+    h.switchboard("bob").args(["send", "hi"]).assert().success();
+
+    let alice_jsonl = h.project_dir.join("alice-session.jsonl");
+    let bob_jsonl = h.project_dir.join("bob-session.jsonl");
+    // alice at 30% — above multi 0.25 threshold, below single 0.50 threshold.
+    h.write_assistant_turn(&alice_jsonl, "claude-haiku-4-5", 1, 0, 60_000, 100);
+    h.switchboard("alice").args(["send", "posting"]).assert().success();
+    thread::sleep(Duration::from_millis(50));
+    // bob at 10% — below all thresholds.
+    h.write_assistant_turn(&bob_jsonl, "claude-haiku-4-5", 1, 0, 20_000, 100);
+    h.switchboard("bob").args(["send", "posting"]).assert().success();
+
+    let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warns: Vec<_> = lines
+        .iter()
+        .filter(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .collect();
+    assert_eq!(warns.len(), 1, "expected 1 warning (alice at 30% > multi 25%); got {}", warns.len());
+    let body = warns[0]["body"].as_str().unwrap();
+    assert!(body.contains("alice"), "expected alice; got: {body}");
+    assert!(body.contains("30%"), "expected 30%%; got: {body}");
+    assert!(body.contains("consider /compact"), "expected warn action; got: {body}");
+    assert_eq!(warns[0]["level"], "warning");
+}
+
+#[test]
 fn graceful_shutdown_emits_leave() {
     ensure_switchboard_built();
     let h = Harness::new();
@@ -551,8 +586,10 @@ fn graceful_shutdown_emits_leave() {
     let lines = h.read_log_lines("default");
     let bot_leave = lines
         .iter()
-        .find(|l| l["kind"] == "leave" && l["handle"] == "bot-token-watcher");
-    assert!(bot_leave.is_some(), "expected bot to emit leave on shutdown");
+        .find(|l| l["kind"] == "leave" && l["handle"] == "bot-token-watcher")
+        .expect("expected bot to emit leave on shutdown");
+    assert_eq!(bot_leave["kind"], "leave");
+    assert_eq!(bot_leave["handle"], "bot-token-watcher");
 
     let peer = h.sw_dir.path().join("default").join("peers").join("bot-token-watcher");
     assert!(!peer.exists(), "peer file should be removed on shutdown");

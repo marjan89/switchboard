@@ -13,9 +13,32 @@ use switchboard::record::Record;
 use switchboard::stream::Tailer;
 
 const DEFAULT_HANDLE: &str = "bot-token-watcher";
-const DEFAULT_THRESHOLDS: &[f64] = &[0.8, 0.9, 0.95];
 const DEFAULT_POLL_SECS: u64 = 5;
 const DRAIN_INTERVAL: Duration = Duration::from_millis(150);
+
+struct ThresholdRung {
+    ratio: f64,
+    level: &'static str,
+    action: &'static str,
+}
+
+const MULTI_AGENT_DEFAULTS: &[ThresholdRung] = &[
+    ThresholdRung { ratio: 0.25, level: "warning",  action: "consider /compact" },
+    ThresholdRung { ratio: 0.40, level: "alert",    action: "compact now" },
+    ThresholdRung { ratio: 0.50, level: "critical", action: "bleeding tokens" },
+];
+
+const SINGLE_AGENT_DEFAULTS: &[ThresholdRung] = &[
+    ThresholdRung { ratio: 0.50, level: "warning",  action: "consider /compact" },
+    ThresholdRung { ratio: 0.60, level: "alert",    action: "compact now" },
+    ThresholdRung { ratio: 0.70, level: "critical", action: "bleeding tokens" },
+];
+
+const LEVEL_PROGRESSION: &[(&str, &str)] = &[
+    ("warning",  "consider /compact"),
+    ("alert",    "compact now"),
+    ("critical", "bleeding tokens"),
+];
 
 const DEFAULT_WINDOW: u64 = 200_000;
 
@@ -48,7 +71,7 @@ struct Cli {
     #[arg(long, conflicts_with = "channel")]
     all: bool,
 
-    /// Threshold ratio (0.0-1.0). Repeat for multiple rungs. Default: 0.8 0.9 0.95.
+    /// Threshold ratio (0.0-1.0). Repeat for multiple rungs. Overrides peer-count defaults.
     #[arg(long, value_parser = parse_threshold)]
     threshold: Vec<f64>,
 
@@ -242,15 +265,31 @@ fn fmt_kilo(n: u64) -> String {
     }
 }
 
-fn format_warning(handle: &str, model: &str, input: u64, window: u64, pct: f64) -> String {
+fn format_warning(handle: &str, model: &str, input: u64, window: u64, pct: f64, action: &str) -> String {
     format!(
-        "⚠ {} ({}) at {}/{} ({:.0}%) — consider /compact",
+        "\u{26a0} {} ({}) at {}/{} ({:.0}%) \u{2014} {}",
         handle,
         model,
         fmt_kilo(input),
         fmt_kilo(window),
-        pct * 100.0
+        pct * 100.0,
+        action
     )
+}
+
+fn build_custom_rungs(ratios: &[f64]) -> Vec<ThresholdRung> {
+    ratios
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| {
+            let idx = i.min(LEVEL_PROGRESSION.len() - 1);
+            ThresholdRung {
+                ratio: r,
+                level: LEVEL_PROGRESSION[idx].0,
+                action: LEVEL_PROGRESSION[idx].1,
+            }
+        })
+        .collect()
 }
 
 fn bot_join(env: &Env, channel: &str, handle: &str) -> Result<()> {
@@ -285,12 +324,13 @@ fn peer_is_fresh(env: &Env, channel: &str, handle: &str) -> bool {
 fn main() -> Result<()> {
     let args = Cli::parse();
 
-    let mut thresholds = if args.threshold.is_empty() {
-        DEFAULT_THRESHOLDS.to_vec()
+    let custom_rungs: Option<Vec<ThresholdRung>> = if args.threshold.is_empty() {
+        None
     } else {
-        args.threshold.clone()
+        let mut sorted = args.threshold.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(build_custom_rungs(&sorted))
     };
-    thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let context_overrides: HashMap<String, u64> = args.context_window.into_iter().collect();
     let verbose = args.verbose;
@@ -340,9 +380,13 @@ fn main() -> Result<()> {
         .unwrap_or_else(Instant::now);
     let mut last_sitrep = Instant::now();
 
+    let threshold_desc = match &custom_rungs {
+        Some(cr) => format!("custom {:?}", cr.iter().map(|r| r.ratio).collect::<Vec<_>>()),
+        None => "auto (multi=[0.25,0.40,0.50] single=[0.50,0.60,0.70])".to_string(),
+    };
     eprintln!(
-        "token-watcher started. handle={} channels={:?} thresholds={:?} poll={}s sitrep={}s",
-        handle, initial_channels, thresholds, args.poll, args.sitrep
+        "token-watcher started. handle={} channels={:?} thresholds={} poll={}s sitrep={}s",
+        handle, initial_channels, threshold_desc, args.poll, args.sitrep
     );
 
     while running.load(Ordering::SeqCst) {
@@ -437,18 +481,22 @@ fn main() -> Result<()> {
         // Periodic threshold check.
         if last_poll.elapsed() >= poll {
             for (ch_name, state) in channels.iter_mut() {
+                let fresh_peers: usize = state
+                    .peers
+                    .keys()
+                    .filter(|h| peer_is_fresh(&env, ch_name, h))
+                    .count();
+                let rungs: &[ThresholdRung] = match &custom_rungs {
+                    Some(cr) => cr,
+                    None if fresh_peers >= 2 => MULTI_AGENT_DEFAULTS,
+                    None => SINGLE_AGENT_DEFAULTS,
+                };
+
                 let mut warnings: Vec<(String, &'static str)> = vec![];
                 for (peer_handle, ps) in state.peers.iter_mut() {
-                    // Skip stale peers — they're tracked but not currently around.
-                    // They re-engage automatically on next fresh send (which touches
-                    // peers/<handle>).
                     if !peer_is_fresh(&env, ch_name, peer_handle) {
                         continue;
                     }
-                    // Retry correlation only if the most recent message hasn't been
-                    // correlated yet (or if a fresher message has arrived since the
-                    // last successful correlation). Sticky once mapped — no
-                    // ping-ponging transcript_path across sibling sessions' jsonls.
                     if ps.last_message_ts != ps.last_correlated_ts {
                         if let Some(ts) = ps.last_message_ts {
                             if let Some(project_dir) = encoded_project_dir(&ps.cwd) {
@@ -465,7 +513,7 @@ fn main() -> Result<()> {
                         }
                     }
                     let Some(transcript) = ps.transcript_path.as_ref() else {
-                        continue; // no message yet — no mapping
+                        continue;
                     };
                     let reading = match read_reading(transcript) {
                         Some(r) => r,
@@ -479,14 +527,14 @@ fn main() -> Result<()> {
                         continue;
                     }
 
-                    let lowest_bound = (thresholds[0] * window as f64) as u64;
+                    let lowest_bound = (rungs[0].ratio * window as f64) as u64;
                     if reading.input < lowest_bound {
                         ps.crossed.clear();
                     }
 
                     let mut new_idx: Option<usize> = None;
-                    for (i, &t) in thresholds.iter().enumerate() {
-                        let bound = (t * window as f64) as u64;
+                    for (i, rung) in rungs.iter().enumerate() {
+                        let bound = (rung.ratio * window as f64) as u64;
                         if reading.input >= bound && !ps.crossed.contains(&i) {
                             new_idx = Some(i);
                         }
@@ -494,14 +542,9 @@ fn main() -> Result<()> {
 
                     if let Some(i) = new_idx {
                         let pct = reading.input as f64 / window as f64;
-                        let level: &'static str = if thresholds[i] >= 0.9 {
-                            "critical"
-                        } else {
-                            "warning"
-                        };
                         warnings.push((
-                            format_warning(peer_handle, &reading.model, reading.input, window, pct),
-                            level,
+                            format_warning(peer_handle, &reading.model, reading.input, window, pct, rungs[i].action),
+                            rungs[i].level,
                         ));
                         for j in 0..=i {
                             ps.crossed.insert(j);
