@@ -1,5 +1,7 @@
+mod daemon;
+
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,7 +57,6 @@ fn default_context_window(model: &str) -> u64 {
         .unwrap_or(DEFAULT_WINDOW)
 }
 
-/// Peers whose `peers/<handle>` mtime is older than this are treated as gone
 #[derive(Parser)]
 #[command(
     name = "switchboard-token-watcher",
@@ -63,6 +64,22 @@ fn default_context_window(model: &str) -> u64 {
     about = "Switchboard bot: warn participants approaching their model's context-window limit"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the bot in the foreground.
+    Run(RunArgs),
+    /// Install and start as a launchd daemon.
+    Start(RunArgs),
+    /// Stop and uninstall the launchd daemon.
+    Stop,
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
     /// Channels to watch. Repeat for multiple. Mutually exclusive with --all.
     #[arg(long)]
     channel: Vec<String>,
@@ -94,6 +111,31 @@ struct Cli {
     /// Print correlation diagnostics to stderr.
     #[arg(long)]
     verbose: bool,
+}
+
+impl RunArgs {
+    fn to_cli_args(&self) -> Vec<String> {
+        let mut args = vec![];
+        if self.all {
+            args.push("--all".into());
+        }
+        for ch in &self.channel {
+            args.extend(["--channel".into(), ch.clone()]);
+        }
+        for t in &self.threshold {
+            args.extend(["--threshold".into(), t.to_string()]);
+        }
+        args.extend(["--poll".into(), self.poll.to_string()]);
+        args.extend(["--sitrep".into(), self.sitrep.to_string()]);
+        args.extend(["--handle".into(), self.handle.clone()]);
+        for (k, v) in &self.context_window {
+            args.extend(["--context-window".into(), format!("{k}={v}")]);
+        }
+        if self.verbose {
+            args.push("--verbose".into());
+        }
+        args
+    }
 }
 
 fn parse_threshold(s: &str) -> Result<f64, String> {
@@ -322,8 +364,68 @@ fn peer_is_fresh(env: &Env, channel: &str, handle: &str) -> bool {
 }
 
 fn main() -> Result<()> {
-    let args = Cli::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        Cmd::Run(args) => run_bot(args),
+        Cmd::Start(args) => start_daemon(args),
+        Cmd::Stop => stop_daemon(),
+    }
+}
 
+fn start_daemon(args: RunArgs) -> Result<()> {
+    let plist = daemon::plist_path()?;
+
+    if plist.exists() {
+        bail!(
+            "daemon already installed at {}; run `stop` first",
+            plist.display()
+        );
+    }
+
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let run_args = args.to_cli_args();
+
+    let mut env_vars = vec![];
+    if let Ok(dir) = std::env::var("SWITCHBOARD_DIR") {
+        env_vars.push(("SWITCHBOARD_DIR".into(), dir));
+    }
+
+    let content = daemon::generate_plist(&binary, &run_args, &env_vars);
+
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&plist, &content)?;
+    eprintln!("plist written to {}", plist.display());
+
+    if let Err(e) = daemon::load(&plist) {
+        let _ = std::fs::remove_file(&plist);
+        bail!("failed to load daemon: {e}");
+    }
+
+    eprintln!("daemon started (label: {})", daemon::LABEL);
+    Ok(())
+}
+
+fn stop_daemon() -> Result<()> {
+    let plist = daemon::plist_path()?;
+
+    if !plist.exists() {
+        eprintln!("no daemon installed (checked {})", plist.display());
+        return Ok(());
+    }
+
+    if daemon::is_loaded() {
+        daemon::unload(&plist)?;
+        eprintln!("daemon unloaded");
+    }
+
+    std::fs::remove_file(&plist)?;
+    eprintln!("plist removed");
+    Ok(())
+}
+
+fn run_bot(args: RunArgs) -> Result<()> {
     let custom_rungs: Option<Vec<ThresholdRung>> = if args.threshold.is_empty() {
         None
     } else {

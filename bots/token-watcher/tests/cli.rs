@@ -116,10 +116,12 @@ impl Harness {
     }
 
     fn spawn_bot(&self, args: &[&str]) -> std::process::Child {
+        let mut all_args = vec!["run"];
+        all_args.extend(args);
         std::process::Command::new(watcher_bin())
             .env("SWITCHBOARD_DIR", self.sw_dir.path())
             .env("HOME", self.home.path())
-            .args(args)
+            .args(&all_args)
             .spawn()
             .unwrap()
     }
@@ -510,7 +512,7 @@ fn verbose_logs_correlation_to_stderr() {
     let mut child = std::process::Command::new(watcher_bin())
         .env("SWITCHBOARD_DIR", h.sw_dir.path())
         .env("HOME", h.home.path())
-        .args(["--channel", "default", "--poll", "1", "--verbose"])
+        .args(["run", "--channel", "default", "--poll", "1", "--verbose"])
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -569,7 +571,7 @@ fn graceful_shutdown_emits_leave() {
     let child = std::process::Command::new(watcher_bin())
         .env("SWITCHBOARD_DIR", h.sw_dir.path())
         .env("HOME", h.home.path())
-        .args(["--channel", "default", "--poll", "60"])
+        .args(["run", "--channel", "default", "--poll", "60"])
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -593,4 +595,48 @@ fn graceful_shutdown_emits_leave() {
 
     let peer = h.sw_dir.path().join("default").join("peers").join("bot-token-watcher");
     assert!(!peer.exists(), "peer file should be removed on shutdown");
+}
+
+#[test]
+fn stop_without_start_succeeds() {
+    let h = Harness::new();
+    let output = std::process::Command::new(watcher_bin())
+        .env("HOME", h.home.path())
+        .args(["stop"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stop should succeed when no daemon installed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no daemon installed"),
+        "stderr should mention no daemon: {stderr}"
+    );
+}
+
+#[test]
+fn start_rejects_double_install() {
+    let h = Harness::new();
+    let plist_dir = h.home.path().join("Library").join("LaunchAgents");
+    fs::create_dir_all(&plist_dir).unwrap();
+    fs::write(
+        plist_dir.join("com.aperture.switchboard-token-watcher.plist"),
+        "existing",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(watcher_bin())
+        .env("HOME", h.home.path())
+        .env("SWITCHBOARD_DIR", h.sw_dir.path())
+        .args(["start", "--channel", "default"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "start should fail when plist exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already installed"),
+        "stderr should mention already installed: {stderr}"
+    );
 }
