@@ -45,8 +45,9 @@ const LEVEL_PROGRESSION: &[(&str, &str)] = &[
 const DEFAULT_WINDOW: u64 = 200_000;
 
 const MODEL_WINDOWS: &[(&str, u64)] = &[
-    ("claude-opus-4", 1_000_000),
-    ("claude-sonnet-4", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-6", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
 ];
 
 fn default_context_window(model: &str) -> u64 {

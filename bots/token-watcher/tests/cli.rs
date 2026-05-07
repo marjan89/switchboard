@@ -640,3 +640,29 @@ fn start_rejects_double_install() {
         "stderr should mention already installed: {stderr}"
     );
 }
+
+#[test]
+fn older_opus_uses_200k_not_1m() {
+    ensure_switchboard_built();
+    let h = Harness::new();
+    h.switchboard("alice").args(["send", "hi"]).assert().success();
+
+    let transcript = h.project_dir.join("alice-session.jsonl");
+    // 120k on opus-4-5 → 60% of 200k (should warn at single-agent 0.50 threshold).
+    // Bug: broad "claude-opus-4" prefix assigns 1M window → 120k/1M = 12% → no warning.
+    h.write_assistant_turn(&transcript, "claude-opus-4-5-20250415", 1, 0, 120_000, 100);
+
+    let mut child = h.spawn_bot(&["--channel", "default", "--poll", "1"]);
+    thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = h.read_log_lines("default");
+    let warning = lines
+        .iter()
+        .find(|l| l["kind"] == "service_announcement" && l["from"] == "bot-token-watcher")
+        .expect("expected warning for opus-4-5 at 60% of 200k");
+    let body = warning["body"].as_str().unwrap();
+    assert!(body.contains("200.0k"), "expected 200k window; got: {body}");
+    assert!(body.contains("60%"), "expected 60%%; got: {body}");
+}
