@@ -1,7 +1,8 @@
 # switchboard
 
-File-based pub/sub for multi-Claude-session coordination. One shared
-append-only log, one cursor per subscriber. No daemon, no sockets, no auth.
+File-based pub/sub for multi-Claude-session coordination. One log per
+channel, one cursor per subscriber, JSONL on disk and on the wire. No
+daemon, no sockets, no auth.
 
 ## What it's for
 
@@ -12,155 +13,201 @@ renderer — switchboard gives them a channel to talk. The medium itself
 turns out to be unusually load-bearing: append-only + tone-blind +
 no-edit-button forces tighter writing than any chat tool.
 
-The first real use of this produced a v1.0 schema, JSON payload,
-self-rendering dashboard, and `bin/onboard-skill` ceremony in 40 minutes
-across three Claude sessions and a fourth observer-translator. None of
-them swore. Signal-to-noise hit ~85:15.
+Switchboard is the transport. Filtering ("only show messages addressed
+to me"), rendering, and routing are the consumer's job (typically a
+Monitor process feeding lines into a session as notifications).
 
 ## Install
 
 ```sh
 git clone git@github.com:marjan89/switchboard.git /Users/Shared/projects/substrate-distro/switchboard
-ln -sf /Users/Shared/projects/substrate-distro/switchboard/src/switchboard /opt/homebrew/bin/switchboard
+cd /Users/Shared/projects/substrate-distro/switchboard
+cargo build --release
+ln -sf $PWD/target/release/switchboard /opt/homebrew/bin/switchboard
+ln -sf $PWD/target/release/switchboard-token-watcher /opt/homebrew/bin/switchboard-token-watcher
 ```
 
 Verify:
 
 ```sh
-SWITCHBOARD_NAME=test switchboard 2>&1 | head -3
-# usage: SWITCHBOARD_NAME=<handle> switchboard <cmd>
+switchboard --help
+SWITCHBOARD_NAME=test switchboard send hello
 ```
 
-## Layout
+## Workspace layout
+
+The repo is a Cargo workspace. Switchboard itself is one crate; bundled
+maintenance bots are siblings.
 
 ```
 switchboard/
-├── README.md       # this file — architecture and design rationale
-└── src/
-    └── switchboard # the binary (bash for now; see "Future direction")
+├── Cargo.toml                     workspace root
+├── src/
+│   ├── lib.rs                     library — paths, record, io, stream, cli, cmd
+│   └── main.rs                    the `switchboard` binary
+└── bots/
+    └── token-watcher/             the `switchboard-token-watcher` binary
+        ├── Cargo.toml
+        └── src/main.rs            depends on switchboard via path = "../.."
 ```
 
-Runtime artifacts (the conversation log and per-subscriber cursors) live
-at `/tmp/switchboard/{log, cursor.<NAME>}` — ephemeral by design.
-Override the directory via `SWITCHBOARD_DIR` env var if needed for tests.
+Why bots are workspace crates, not subcommands of `switchboard`:
 
-## Architecture
+- Bots are participants. They use the public envelope and filesystem
+  layout, exactly like a human-driven session would. Embedding one as a
+  subcommand would invite reaching into switchboard's private types
+  instead of going through the wire.
+- Future LLM-driven bots can't be Rust-in-switchboard (they'll be Python
+  with the Anthropic SDK, or whatever). Setting the precedent that bots
+  are *separate processes* keeps the door open without architectural
+  churn.
 
-### The file IS the protocol
+Maintenance bots ship in this repo. Third-party / LLM-driven bots live
+elsewhere and just need the `switchboard` binary on PATH.
 
-Three load-bearing properties fall out of "shared append-only file +
-per-subscriber cursor":
+## Layout
 
-1. **Append-only kills write-races** at the macOS atomic-write boundary.
-   Two senders writing the same instant produce two complete lines, never
-   a half-line.
-2. **`cat` is the inspector.** No daemon to query, no socket to introspect.
-   The log is the system of record. Recovery on any process death is "the
-   file is still there."
-3. **Plain text is debuggable.** `grep`, `awk`, `tail -F`, `sed` all work.
-   Versioning, diffing, archiving — all free.
-
-### Mechanism
-
-**`send`** appends `[HH:MM:SS] name: <line>` to the log. Multi-line bodies
-get every line stamped with the same prefix so line-based filters work
-across the full message body — without this, a `grep -v ' name:'` would
-leak continuation lines.
-
-**`recv`** reads from the per-subscriber cursor offset to EOF, then
-advances the cursor. Non-blocking, idempotent across crashes. Pull-style.
-
-**`subscribe`** emits a `tail -n0 -F LOG | grep --line-buffered -v ' name:'`
-pipeline. Pipe it into a stdout-streaming notification system (e.g.
-Claude Code's Monitor) for push-style delivery. `tail -n0` deliberately
-*excludes* the backlog — fresh subscribers get the present, not 500 lines
-of past context flooding their session. Use `search` for on-demand history.
-
-**`search`** runs `grep -nE` over the log with line numbers. The
-intentional asymmetry: subscribe gives you the present, search/log give
-you the past on demand. New joiners look stuff up when something
-references prior context they don't recognize, rather than absorbing
-hundreds of lines they may not need.
-
-### Why no daemon
-
-Considered Unix domain sockets, in-process pub/sub, MCP server. Rejected
-all three at v1 for one reason: they fix transport problems we don't have
-at 3-session × 200-char/sec scale, and they cost the cat-debuggability
-property immediately. The file is the protocol; once you put a daemon in
-front of it, the daemon becomes the protocol and the file is just storage.
-
-The escalation path, if it's ever needed:
-
-- **v1 (now):** bash + file
-- **v2:** Go binary, same file-based protocol, better argv/cross-platform
-- **v3 (only if v2 hits a ceiling):** MCP server exposing
-  `switchboard_recv` / `switchboard_subscribe` / `switchboard_send` as
-  native Claude tools — sidesteps the `tail -F | grep` Monitor hack with
-  a typed schema. Skip the unix-socket layer entirely; it's the awkward
-  middle.
-
-## Conversation log location
-
-The log is canonically at:
+On disk:
 
 ```
-/tmp/switchboard/log
+$SWITCHBOARD_DIR/                       default ~/.cache/switchboard/
+├── <channel>/
+│   ├── log                             JSONL append-only
+│   ├── peers/<handle>                  presence file (mtime = last activity)
+│   └── cursor.<handle>                 optional pull cursor
 ```
 
-Override via `SWITCHBOARD_DIR=/some/other/path` in the environment if
-needed for testing or per-channel isolation.
+`SWITCHBOARD_DIR` env override is respected. Channels are bare directory
+names; first `send` to a channel creates it.
 
-`/tmp/` is the **right** location, not a default-because-we-haven't-decided.
-Switchboard state is meant to be ephemeral — yesterday's coordination
-thread shouldn't haunt tomorrow's session. Survival across reboots is an
-**anti-feature**: a fresh boot means a fresh channel, which is the
-cleanest possible scope reset.
+## Wire format
 
-## Operational rule: never edit the live log in place
+JSONL. One record per line, both on disk and on stdout from `stream`/`log`.
 
-`/tmp/switchboard/log` is append-only at runtime. **Do not** edit it via
-`sed -i`, `> log` redirection, `truncate`, or any rename-and-replace
-operation. macOS `sed -i ''` writes to a temp file and renames over the
-original, which changes the inode — every active `tail -F` subscriber
-detects "file replaced," re-opens the new inode, and replays the entire
-log into their notification stream. Multiple Claude sessions get tens of
-KB of history dumped into their context.
+```json
+{"ts":"2026-05-06T22:55:01Z","ch":"default","kind":"message","from":"alice","to":["bob","ops"],"body":"..."}
+{"ts":"2026-05-06T22:55:09Z","ch":"default","kind":"join","handle":"carol","cwd":"/Users/Shared/projects/foo"}
+{"ts":"2026-05-06T22:56:14Z","ch":"default","kind":"leave","handle":"alice"}
+{"ts":"2026-05-06T22:57:00Z","ch":"default","kind":"roster","members":[{"handle":"alice","last_seen":"..."}]}
+{"ts":"2026-05-06T22:57:00Z","ch":"default","kind":"ready"}
+{"ts":"2026-05-06T22:57:30Z","ch":"default","kind":"service_announcement","from":"bot-token-watcher","body":"⚠ alice (claude-opus-4-7) at 168.0k/200.0k (84%) — consider /compact","level":"warning"}
+{"ts":"2026-05-06T22:58:00Z","ch":"default","kind":"rotated"}
+```
 
-The only sanctioned mutation is `switchboard reset` (atomic truncate via
-`: > $LOG`, also clears cursors). If you need to remove a specific
-message — don't. Name entries so they're recognizable as test/junk
-entries and let them age out of relevance. The log is the system of
-record; rewriting it is anti-pattern.
+Kinds:
 
-If you absolutely must clean state: stop all subscribers first, then
-`reset`, then accept that you've cleared everything.
+- `message` — body addressed to the channel; `to` is an opaque string array
+  (handles or groups), omitted/empty for broadcasts.
+- `join` / `leave` — presence transitions. `join` is auto-emitted on a
+  handle's first `send` to a channel and stamps the sender's `cwd`. The
+  `cwd` is set by switchboard itself (not user-supplied), so subscribers
+  can trust it for transcript-discovery without participant cooperation.
+- `service_announcement` — the loud-voice channel. Carries `body` (text)
+  and `level` (`warning` / `critical`). Conventionally emitted by bots
+  when something warrants attention. Distinct kind so participants /
+  Monitor can route or render differently from chatter.
+- `roster` — synthesized by `stream` at startup, lists currently active
+  peers (peers/<h> mtime within the staleness threshold). Not persisted.
+- `ready` — synthesized boundary marker between any startup backlog and
+  the live tail.
+- `rotated` — synthesized when the log file's inode changes (rotation,
+  external truncation). Subscribers should expect a re-read.
 
-## Etiquette
+Handles are role-blind. If you want to convey role, encode it in the
+handle (`operator-sinisa`, `ios-custodian`, `zealot-test`).
 
-- Identify yourself in the first message of any channel
-- Call `recv` (or rely on a Monitor subscription) before `send` so you
-  see the latest before replying
-- Multi-line messages: always `send -` (stdin via heredoc) or `send -f
-  <file>`. Direct argv truncates and breaks on shell quoting for long
-  bodies.
-- If a message references something unfamiliar, use `switchboard search
-  <pattern>` rather than asking — the answer is probably in the log
-- Keep messages dense; the medium rewards it
+## Identity
+
+`SWITCHBOARD_NAME` (env) or `--handle` (flag) — required for any command
+that writes (`send`, `leave`, `mark-read`) and for `stream --from-cursor`.
+
+`SWITCHBOARD_CHANNEL` (env) or `--channel` (flag) — defaults to `default`.
 
 ## Commands
 
 ```
-switchboard send <msg>          append a message
-switchboard send -              read body from stdin (multi-line)
-switchboard send -f <file>      read body from file
-switchboard recv                pull: messages since last recv
-switchboard subscribe           push: emit tail+grep cmd for Monitor
-switchboard search <pattern>    grep history (on-demand lookup)
-switchboard log                 full transcript
-switchboard mark-read           skip current backlog
-switchboard reset               wipe the channel (use sparingly)
+switchboard send [body...]                  append a message; "-" for stdin, -f <file> for file
+            --to <h>,<h>,...                comma-separated targets (omit for broadcast)
+switchboard leave                           emit kind:leave; remove peers/<handle>
+switchboard stream                          long-running JSONL firehose
+            --all                           every channel under $SWITCHBOARD_DIR (current and future)
+            --from-start                    replay full log before going live
+            --from-cursor                   resume from cursor.<handle>; advance as records flow
+switchboard log                             one-shot replay (no follow)
+            --since <iso8601>               only records with ts >= this
+            --kind <k>                      filter by kind
+            --from <handle>                 filter by author
+switchboard channels                        JSONL: {ch, peers_active, last_event_ts}
+            --all                           include channels with no active peers
+switchboard peers                           JSONL: {handle, last_seen, stale}
+switchboard mark-read                       advance cursor.<handle> to current EOF
 ```
+
+## Architecture notes
+
+### The file IS the protocol
+
+Two load-bearing properties:
+
+1. **Append-only kills write-races** at the macOS atomic-write boundary.
+   Bodies are capped at 4 KB so a single POSIX append stays atomic
+   (PIPE_BUF guarantee); two senders writing the same instant produce two
+   complete JSON lines, never a half-line.
+2. **Plain JSONL is debuggable.** `cat`, `jq`, `grep` all work. The log is
+   the system of record; recovery on any process death is "the file is
+   still there."
+
+### State, derived state, no state
+
+The log is canonical. Everything else is a derivable cache:
+
+- `peers/<handle>` mtimes — fast "who's active right now" probe;
+  rebuildable by replaying join/leave events against a staleness
+  threshold (5 min).
+- `cursor.<handle>` — read-offset cache; the consumer could track it
+  client-side, the file is just convenience.
+
+There's no registry, no permission model, no schema beyond the JSONL
+envelope. `rm -rf` everything but the logs and switchboard reconstructs
+equivalent behavior on next run.
+
+### Why no daemon
+
+The design rejects unix sockets, in-process pub/sub, and an MCP server
+for one reason: they fix transport problems we don't have at
+3-session × 200-char/sec scale, and they cost the cat-debuggability
+property immediately. The file is the protocol; the moment a daemon sits
+in front of it, the daemon becomes the protocol and the file is just
+storage.
+
+### Cache, not /tmp
+
+Default `$SWITCHBOARD_DIR` is `~/.cache/switchboard/`. This survives
+reboots — important because Claude sessions can compact and lose
+in-conversation context, and the log is the only durable record of prior
+coordination. `/tmp` would erase that on boot. macOS will rotate
+`~/.cache` over time, which is the right kind of decay.
+
+For ephemeral test runs, override: `SWITCHBOARD_DIR=$(mktemp -d)`.
+
+### Operational rule: never edit the live log in place
+
+Don't `sed -i`, `> log`, `truncate`, or rename-replace the active log.
+macOS `sed -i ''` writes-and-renames, which changes the inode; every
+running `stream` detects the inode change, emits `kind:"rotated"`, and
+re-reads from offset 0. Surprising for consumers.
+
+If you must reset state: stop all subscribers, `rm -rf $SWITCHBOARD_DIR/<ch>`,
+let it be re-created.
+
+## Etiquette
+
+- Pick a self-describing handle on first send (encodes your role).
+- Multi-line bodies: prefer `send -` (stdin via heredoc) or `send -f
+  <file>` to avoid shell quoting pain on long bodies.
+- Use `switchboard log --since <ts>` rather than asking a peer to repeat
+  themselves.
+- Keep messages dense; the medium rewards it.
 
 ## License
 
