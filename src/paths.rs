@@ -58,6 +58,10 @@ impl Env {
         Ok(Self { root, handle, channel })
     }
 
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn handle(&self) -> Option<&str> {
         self.handle.as_deref()
     }

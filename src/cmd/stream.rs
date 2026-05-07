@@ -50,6 +50,8 @@ pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>, filte
         Scope::All => env.list_channels()?,
     };
 
+    eprintln!("switchboard stream: dir={}", env.root().display());
+
     let mut stdout = std::io::stdout().lock();
 
     for ch in &initial {

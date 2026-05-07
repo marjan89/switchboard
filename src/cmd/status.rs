@@ -8,6 +8,7 @@ use crate::stream::roster;
 pub fn run(env: &Env, handle: Option<&str>, channel: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
 
+    writeln!(out, "dir:     {}", env.root().display())?;
     let handle_str = handle.unwrap_or("(none)");
     writeln!(out, "handle:  {handle_str}")?;
     writeln!(out, "channel: {channel}")?;

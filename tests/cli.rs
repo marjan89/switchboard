@@ -364,6 +364,7 @@ fn status_shows_channel_and_peer_count() {
 
     let out = cmd(&dir, "alice").args(["status"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("dir:"), "status should show dir: {stdout}");
     assert!(stdout.contains("handle:  alice"), "stdout: {stdout}");
     assert!(stdout.contains("channel: default"), "stdout: {stdout}");
     assert!(stdout.contains("2 active"), "stdout: {stdout}");
@@ -566,4 +567,38 @@ fn auto_chunk_does_not_split_multibyte_char() {
     assert!(total.contains('\u{1F525}'), "emoji should be intact after chunking");
     assert!(!total.contains('\u{FFFD}'), "no replacement characters");
     assert_eq!(total.len(), body.len(), "reassembled length should match original");
+}
+
+#[test]
+fn peers_empty_channel_hints_on_stderr() {
+    let dir = TempDir::new().unwrap();
+    let out = cmd(&dir, "alice").args(["peers"]).output().unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no peers"),
+        "empty peers should hint on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn stream_prints_dir_on_startup() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+
+    let mut child = raw_cmd(&dir, "bob")
+        .args(["stream", "--from-start"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dir="),
+        "stream should print dir on stderr: {stderr}"
+    );
 }

@@ -16,6 +16,7 @@ struct PeerInfo {
 pub fn run(env: &Env, channel: &str) -> Result<()> {
     let peers_dir = env.peers_dir(channel);
     if !peers_dir.exists() {
+        eprintln!("no peers on this channel — verify SWITCHBOARD_DIR if expecting peers");
         return Ok(());
     }
     let now = SystemTime::now();
@@ -38,10 +39,14 @@ pub fn run(env: &Env, channel: &str) -> Result<()> {
     entries.sort_by(|a, b| a.handle.cmp(&b.handle));
 
     let mut stdout = std::io::stdout().lock();
-    for e in entries {
-        serde_json::to_writer(&mut stdout, &e)?;
+    for e in &entries {
+        serde_json::to_writer(&mut stdout, e)?;
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
+
+    if entries.is_empty() {
+        eprintln!("no peers on this channel — verify SWITCHBOARD_DIR if expecting peers");
+    }
     Ok(())
 }
