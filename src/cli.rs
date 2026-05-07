@@ -74,6 +74,10 @@ pub enum Cmd {
         /// Only records authored by this handle.
         #[arg(long)]
         from: Option<String>,
+
+        /// Only the last N matching records.
+        #[arg(long)]
+        last: Option<usize>,
     },
 
     /// List channels as JSONL: {ch, peers_active, last_event_ts}.
@@ -140,9 +144,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             };
             cmd::stream::run(&env, scope, start, handle, filter)
         }
-        Cmd::Log { since, kind, from } => {
+        Cmd::Log { since, kind, from, last } => {
             let channel = env.channel();
-            cmd::log::run(&env, channel, since.as_deref(), kind.as_deref(), from.as_deref())
+            cmd::log::run(&env, channel, since.as_deref(), kind.as_deref(), from.as_deref(), last)
         }
         Cmd::Channels { all } => cmd::channels::run(&env, all),
         Cmd::Peers => {

@@ -12,6 +12,7 @@ pub fn run(
     since: Option<&str>,
     kind: Option<&str>,
     from: Option<&str>,
+    last: Option<usize>,
 ) -> Result<()> {
     let log_path = env.log_path(channel);
     if !log_path.exists() {
@@ -29,7 +30,7 @@ pub fn run(
     let f = File::open(&log_path)
         .with_context(|| format!("open {}", log_path.display()))?;
     let reader = BufReader::new(f);
-    let mut stdout = std::io::stdout().lock();
+    let mut matching: Vec<String> = Vec::new();
     for line in reader.lines() {
         let line = line?;
         if line.is_empty() {
@@ -56,6 +57,18 @@ pub fn run(
                 continue;
             }
         }
+        matching.push(line);
+    }
+
+    let output = if let Some(n) = last {
+        let skip = matching.len().saturating_sub(n);
+        &matching[skip..]
+    } else {
+        &matching[..]
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    for line in output {
         stdout.write_all(line.as_bytes())?;
         stdout.write_all(b"\n")?;
     }

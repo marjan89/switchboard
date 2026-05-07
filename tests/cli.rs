@@ -308,3 +308,69 @@ fn prune_removes_stale_peers() {
     let bob_peer = dir.path().join("default").join("peers").join("bob");
     assert!(bob_peer.exists(), "fresh bob should survive prune");
 }
+
+#[test]
+fn send_reads_stdin_when_no_body_arg() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice")
+        .args(["send"])
+        .write_stdin("hello from stdin")
+        .assert()
+        .success();
+    let lines = read_log_lines(&dir, "default");
+    let msg = lines.iter().find(|l| l["kind"] == "message").unwrap();
+    assert_eq!(msg["body"], "hello from stdin");
+}
+
+#[test]
+fn log_last_returns_only_n_records() {
+    let dir = TempDir::new().unwrap();
+    for i in 0..5 {
+        cmd(&dir, "alice")
+            .args(["send", &format!("msg{i}")])
+            .assert()
+            .success();
+    }
+    let out = cmd(&dir, "alice")
+        .args(["log", "--kind", "message", "--last", "2"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["body"], "msg3");
+    assert_eq!(lines[1]["body"], "msg4");
+}
+
+#[test]
+fn status_shows_channel_and_peer_count() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    cmd(&dir, "bob").args(["send", "hi"]).assert().success();
+
+    let out = cmd(&dir, "alice").args(["status"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("handle:  alice"), "stdout: {stdout}");
+    assert!(stdout.contains("channel: default"), "stdout: {stdout}");
+    assert!(stdout.contains("2 active"), "stdout: {stdout}");
+}
+
+#[test]
+fn prune_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    let alice_peer = dir.path().join("default").join("peers").join("alice");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    let f = fs::OpenOptions::new().write(true).open(&alice_peer).unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+
+    cmd(&dir, "admin").args(["prune"]).assert().success();
+    assert!(!alice_peer.exists());
+    // Second prune on empty peers — should succeed without error.
+    cmd(&dir, "admin").args(["prune"]).assert().success();
+}
