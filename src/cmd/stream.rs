@@ -21,7 +21,28 @@ pub enum Start {
     FromCursor(String),
 }
 
-pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>) -> Result<()> {
+pub struct Filter {
+    pub exclude_self: Option<String>,
+    pub kind: Option<String>,
+}
+
+impl Filter {
+    fn accept(&self, rec: &Record) -> bool {
+        if let Some(ref me) = self.exclude_self {
+            if rec.from.as_deref() == Some(me.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref k) = self.kind {
+            if rec.kind != *k {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>, filter: Filter) -> Result<()> {
     let mut tailers: HashMap<String, Tailer> = HashMap::new();
 
     let initial: Vec<String> = match &scope {
@@ -36,7 +57,6 @@ pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>) -> Re
     }
 
     loop {
-        // Discover new channels under --all.
         if matches!(scope, Scope::All) {
             for ch in env.list_channels()? {
                 if !tailers.contains_key(&ch) {
@@ -45,20 +65,23 @@ pub fn run(env: &Env, scope: Scope, start: Start, _handle: Option<String>) -> Re
             }
         }
 
-        // Drain every tailer.
         for tailer in tailers.values_mut() {
             let ch = tailer.channel.clone();
             let rotated = tailer.drain(|rec| {
-                serde_json::to_writer(&mut stdout, rec)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                if filter.accept(rec) {
+                    serde_json::to_writer(&mut stdout, rec)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
                 Ok(())
             })?;
             if rotated {
                 let rec = Record::rotated(&ch);
-                serde_json::to_writer(&mut stdout, &rec)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                if filter.accept(&rec) {
+                    serde_json::to_writer(&mut stdout, &rec)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
             }
         }
 

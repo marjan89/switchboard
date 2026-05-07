@@ -51,6 +51,14 @@ pub enum Cmd {
         /// Resume from cursor.<handle>; advance as records flow.
         #[arg(long)]
         from_cursor: bool,
+
+        /// Suppress records where from == your handle.
+        #[arg(long)]
+        exclude_self: bool,
+
+        /// Only emit records with this kind (e.g. message, service_announcement).
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
     },
 
     /// One-shot replay of the channel log with optional filters (no follow).
@@ -81,6 +89,9 @@ pub enum Cmd {
     /// One-shot pull: emit records since cursor, then advance cursor to EOF.
     Recv,
 
+    /// Show connection status: handle, channel, peer count, log size, cursor.
+    Status,
+
     /// Remove stale peer files (mtime older than PEER_STALE_SECS).
     Prune,
 
@@ -103,10 +114,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let channel = env.channel();
             cmd::leave::run(&env, handle, channel)
         }
-        Cmd::Stream { all, from_start, from_cursor } => {
+        Cmd::Stream { all, from_start, from_cursor, exclude_self, kind } => {
             let handle = env.handle().map(String::from);
             if from_cursor && handle.is_none() {
                 return Err(anyhow!("--from-cursor requires --handle or $SWITCHBOARD_NAME"));
+            }
+            if exclude_self && handle.is_none() {
+                return Err(anyhow!("--exclude-self requires --handle or $SWITCHBOARD_NAME"));
             }
             let scope = if all {
                 cmd::stream::Scope::All
@@ -120,7 +134,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 cmd::stream::Start::FromEof
             };
-            cmd::stream::run(&env, scope, start, handle)
+            let filter = cmd::stream::Filter {
+                exclude_self: if exclude_self { handle.clone() } else { None },
+                kind,
+            };
+            cmd::stream::run(&env, scope, start, handle, filter)
         }
         Cmd::Log { since, kind, from } => {
             let channel = env.channel();
@@ -135,6 +153,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let handle = env.require_handle()?;
             let channel = env.channel();
             cmd::recv::run(&env, handle, channel)
+        }
+        Cmd::Status => {
+            let handle = env.handle();
+            let channel = env.channel();
+            cmd::status::run(&env, handle, channel)
         }
         Cmd::Prune => {
             let channel = env.channel();
@@ -162,13 +185,24 @@ fn read_body(positional: Vec<String>, file: Option<&str>) -> Result<String> {
             .with_context(|| format!("read body from {path}"));
     }
     if positional.len() == 1 && positional[0] == "-" {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .context("read body from stdin")?;
-        return Ok(buf);
+        return read_stdin();
     }
     if positional.is_empty() {
+        if atty::isnt(atty::Stream::Stdin) {
+            return read_stdin();
+        }
         return Err(anyhow!("empty body. pass words, '-' for stdin, or -f <file>"));
     }
     Ok(positional.join(" "))
+}
+
+fn read_stdin() -> Result<String> {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .context("read body from stdin")?;
+    let trimmed = buf.trim_end().to_string();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty body from stdin"));
+    }
+    Ok(trimmed)
 }

@@ -6,4 +6,5 @@ pub mod peers;
 pub mod prune;
 pub mod recv;
 pub mod send;
+pub mod status;
 pub mod stream;
