@@ -78,6 +78,12 @@ pub enum Cmd {
     /// List peers in the channel as JSONL: {handle, last_seen, stale}.
     Peers,
 
+    /// One-shot pull: emit records since cursor, then advance cursor to EOF.
+    Recv,
+
+    /// Remove stale peer files (mtime older than PEER_STALE_SECS).
+    Prune,
+
     /// Advance cursor.<handle> to current EOF (drop pending backlog).
     MarkRead,
 }
@@ -124,6 +130,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Peers => {
             let channel = env.channel();
             cmd::peers::run(&env, channel)
+        }
+        Cmd::Recv => {
+            let handle = env.require_handle()?;
+            let channel = env.channel();
+            cmd::recv::run(&env, handle, channel)
+        }
+        Cmd::Prune => {
+            let channel = env.channel();
+            cmd::prune::run(&env, channel)
         }
         Cmd::MarkRead => {
             let handle = env.require_handle()?;

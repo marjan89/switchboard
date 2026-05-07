@@ -64,17 +64,26 @@ fn append_only_ordering_preserved() {
 }
 
 #[test]
-fn body_over_4kb_rejected() {
+fn body_over_4kb_auto_chunks() {
     let dir = TempDir::new().unwrap();
-    let big = "x".repeat(5000);
-    let out = cmd(&dir, "alice")
+    let big = "x".repeat(10000);
+    cmd(&dir, "alice")
         .args(["send", &big])
         .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
-    assert!(stderr.contains("4096-byte cap"), "stderr was: {stderr}");
-    // No log written for rejected send.
-    assert!(!dir.path().join("default").join("log").exists());
+        .success();
+    let lines = read_log_lines(&dir, "default");
+    let msgs: Vec<_> = lines.iter().filter(|l| l["kind"] == "message").collect();
+    assert!(msgs.len() >= 3, "expected at least 3 chunks; got {}", msgs.len());
+    let first_body = msgs[0]["body"].as_str().unwrap();
+    assert!(first_body.starts_with("(1/"), "first chunk missing (1/N) marker: {first_body}");
+    let total: String = msgs.iter()
+        .map(|m| {
+            let b = m["body"].as_str().unwrap();
+            let end = b.find(") ").unwrap();
+            b[end + 2..].to_string()
+        })
+        .collect();
+    assert_eq!(total.len(), 10000, "reassembled chunks should equal original length");
 }
 
 #[test]
@@ -239,4 +248,63 @@ fn double_leave_emits_only_once() {
     let lines = read_log_lines(&dir, "default");
     let leaves: Vec<_> = lines.iter().filter(|l| l["kind"] == "leave").collect();
     assert_eq!(leaves.len(), 1, "double leave should emit only one record");
+}
+
+#[test]
+fn recv_returns_since_cursor_then_advances() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "one"]).assert().success();
+    cmd(&dir, "alice").args(["send", "two"]).assert().success();
+    cmd(&dir, "alice").args(["send", "three"]).assert().success();
+
+    let out = cmd(&dir, "bob").args(["recv"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let msgs: Vec<&str> = lines.iter()
+        .filter(|l| l["kind"] == "message")
+        .map(|l| l["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(msgs, vec!["one", "two", "three"]);
+
+    let out = cmd(&dir, "bob").args(["recv"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(), "second recv should return nothing");
+
+    cmd(&dir, "alice").args(["send", "four"]).assert().success();
+    cmd(&dir, "alice").args(["send", "five"]).assert().success();
+
+    let out = cmd(&dir, "bob").args(["recv"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let msgs: Vec<&str> = lines.iter()
+        .filter(|l| l["kind"] == "message")
+        .map(|l| l["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(msgs, vec!["four", "five"]);
+}
+
+#[test]
+fn prune_removes_stale_peers() {
+    let dir = TempDir::new().unwrap();
+    cmd(&dir, "alice").args(["send", "hi"]).assert().success();
+    cmd(&dir, "bob").args(["send", "hi"]).assert().success();
+
+    // Backdate alice's peer file to make it stale (> 300s).
+    let alice_peer = dir.path().join("default").join("peers").join("alice");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    let f = fs::OpenOptions::new().write(true).open(&alice_peer).unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+
+    cmd(&dir, "admin").args(["prune"]).assert().success();
+
+    assert!(!alice_peer.exists(), "stale alice should be pruned");
+    let bob_peer = dir.path().join("default").join("peers").join("bob");
+    assert!(bob_peer.exists(), "fresh bob should survive prune");
 }
