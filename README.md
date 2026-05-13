@@ -24,7 +24,6 @@ git clone git@github.com:marjan89/switchboard.git /Users/Shared/projects/substra
 cd /Users/Shared/projects/substrate-distro/switchboard
 cargo build --release
 ln -sf $PWD/target/release/switchboard /opt/homebrew/bin/switchboard
-ln -sf $PWD/target/release/switchboard-token-watcher /opt/homebrew/bin/switchboard-token-watcher
 ```
 
 Verify:
@@ -34,36 +33,25 @@ switchboard --help
 SWITCHBOARD_NAME=test switchboard send hello
 ```
 
-## Workspace layout
+## Repo layout
 
-The repo is a Cargo workspace. Switchboard itself is one crate; bundled
-maintenance bots are siblings.
+Single Rust crate. One binary: `switchboard`.
 
 ```
 switchboard/
-├── Cargo.toml                     workspace root
+├── Cargo.toml
 ├── src/
 │   ├── lib.rs                     library — paths, record, io, stream, cli, cmd
-│   └── main.rs                    the `switchboard` binary
-└── bots/
-    └── token-watcher/             the `switchboard-token-watcher` binary
-        ├── Cargo.toml
-        └── src/main.rs            depends on switchboard via path = "../.."
+│   ├── main.rs                    the `switchboard` binary
+│   ├── cli.rs                     clap argument definitions
+│   ├── cmd/                       one module per subcommand
+│   ├── io.rs                      atomic append, file I/O
+│   ├── paths.rs                   channel/peer/cursor path resolution
+│   ├── record.rs                  JSONL record types
+│   └── stream.rs                  live tail + backlog replay
+└── tests/
+    └── cli.rs                     integration tests
 ```
-
-Why bots are workspace crates, not subcommands of `switchboard`:
-
-- Bots are participants. They use the public envelope and filesystem
-  layout, exactly like a human-driven session would. Embedding one as a
-  subcommand would invite reaching into switchboard's private types
-  instead of going through the wire.
-- Future LLM-driven bots can't be Rust-in-switchboard (they'll be Python
-  with the Anthropic SDK, or whatever). Setting the precedent that bots
-  are *separate processes* keeps the door open without architectural
-  churn.
-
-Maintenance bots ship in this repo. Third-party / LLM-driven bots live
-elsewhere and just need the `switchboard` binary on PATH.
 
 ## Layout
 
@@ -90,7 +78,7 @@ JSONL. One record per line, both on disk and on stdout from `stream`/`log`.
 {"ts":"2026-05-06T22:56:14Z","ch":"default","kind":"leave","handle":"alice"}
 {"ts":"2026-05-06T22:57:00Z","ch":"default","kind":"roster","members":[{"handle":"alice","last_seen":"..."}]}
 {"ts":"2026-05-06T22:57:00Z","ch":"default","kind":"ready"}
-{"ts":"2026-05-06T22:57:30Z","ch":"default","kind":"service_announcement","from":"bot-token-watcher","body":"⚠ alice (claude-opus-4-7) at 168.0k/200.0k (84%) — consider /compact","level":"warning"}
+{"ts":"2026-05-06T22:57:30Z","ch":"default","kind":"service_announcement","from":"monitor","body":"deployment gate check failed — see #ops","level":"warning"}
 {"ts":"2026-05-06T22:58:00Z","ch":"default","kind":"rotated"}
 ```
 
