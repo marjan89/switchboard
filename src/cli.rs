@@ -99,6 +99,17 @@ pub enum Cmd {
     /// Remove stale peer files (mtime older than PEER_STALE_SECS).
     Prune,
 
+    /// Clean a channel: prune stale peers, reset cursors, rotate log.
+    Clean {
+        /// Remove the entire channel directory. Requires explicit --channel.
+        #[arg(long)]
+        full: bool,
+
+        /// Skip log rotation — only prune peers and reset cursors.
+        #[arg(long, conflicts_with = "full")]
+        keep_log: bool,
+    },
+
     /// Advance cursor.<handle> to current EOF (drop pending backlog).
     MarkRead,
 
@@ -172,6 +183,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Prune => {
             let channel = env.channel();
             cmd::prune::run(&env, channel)
+        }
+        Cmd::Clean { full, keep_log } => {
+            let channel = env.channel();
+            if full && channel == crate::paths::DEFAULT_CHANNEL && cli.channel.is_none() {
+                return Err(anyhow!("--full requires explicit --channel (won't nuke the default channel implicitly)"));
+            }
+            cmd::clean::run(&env, channel, full, keep_log)
         }
         Cmd::MarkRead => {
             let handle = env.require_handle()?;
