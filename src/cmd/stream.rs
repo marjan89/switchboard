@@ -24,7 +24,10 @@ pub enum Start {
 pub struct Filter {
     pub exclude_self: Option<String>,
     pub kind: Option<String>,
+    pub mine: Option<String>,
 }
+
+const SYSTEM_KINDS: &[&str] = &["join", "leave", "hold", "resume", "rotated", "roster", "ready"];
 
 impl Filter {
     fn accept(&self, rec: &Record) -> bool {
@@ -36,6 +39,15 @@ impl Filter {
         if let Some(ref k) = self.kind {
             if rec.kind != *k {
                 return false;
+            }
+        }
+        if let Some(ref me) = self.mine {
+            if !SYSTEM_KINDS.contains(&rec.kind.as_str()) {
+                let is_broadcast = rec.to.is_empty();
+                let is_addressed = rec.to.iter().any(|t| t == me);
+                if !is_broadcast && !is_addressed {
+                    return false;
+                }
             }
         }
         true

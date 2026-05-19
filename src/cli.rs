@@ -59,6 +59,10 @@ pub enum Cmd {
         /// Only emit records with this kind (e.g. message, service_announcement).
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+
+        /// Only deliver messages addressed to your handle (or broadcasts/system kinds).
+        #[arg(long)]
+        mine: bool,
     },
 
     /// One-shot replay of the channel log with optional filters (no follow).
@@ -135,13 +139,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let channel = env.channel();
             cmd::leave::run(&env, handle, channel)
         }
-        Cmd::Stream { all, from_start, from_cursor, exclude_self, kind } => {
+        Cmd::Stream { all, from_start, from_cursor, exclude_self, kind, mine } => {
             let handle = env.handle().map(String::from);
             if from_cursor && handle.is_none() {
                 return Err(anyhow!("--from-cursor requires --handle or $SWITCHBOARD_NAME"));
             }
             if exclude_self && handle.is_none() {
                 return Err(anyhow!("--exclude-self requires --handle or $SWITCHBOARD_NAME"));
+            }
+            if mine && handle.is_none() {
+                return Err(anyhow!("--mine requires --handle or $SWITCHBOARD_NAME"));
             }
             let scope = if all {
                 cmd::stream::Scope::All
@@ -158,6 +165,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let filter = cmd::stream::Filter {
                 exclude_self: if exclude_self { handle.clone() } else { None },
                 kind,
+                mine: if mine { handle.clone() } else { None },
             };
             cmd::stream::run(&env, scope, start, handle, filter)
         }
