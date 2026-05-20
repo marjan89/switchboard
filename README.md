@@ -199,4 +199,4 @@ let it be re-created.
 
 ## License
 
-Whatever sinisa decides. Intended for personal/internal use.
+Apache 2.0
